@@ -292,7 +292,7 @@ def chunked_prefill_paged_decode(
         elif kv_cache_dtype == "fp8_e5m2":
             target_dtype = torch.float8_e5m2
         else:
-            raise ValueError("Unsupported FP8 dtype:", kv_cache_dtype)
+            raise ValueError(f"Unsupported FP8 dtype:{kv_cache_dtype}")
 
         key_cache = key_cache.view(target_dtype)
         value_cache = value_cache.view(target_dtype)

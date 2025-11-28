@@ -657,7 +657,7 @@ def context_attention_fwd(
         elif kv_cache_dtype == "fp8_e5m2":
             target_dtype = torch.float8_e5m2
         else:
-            raise ValueError("Unsupported FP8 dtype:", kv_cache_dtype)
+            raise ValueError(f"Unsupported FP8 dtype:{kv_cache_dtype}")
 
         k_cache = k_cache.view(target_dtype)
         v_cache = v_cache.view(target_dtype)
