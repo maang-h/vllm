@@ -3247,7 +3247,7 @@ class GPUModelRunner(
         #
         if (
             len(self.customize_output_token_ids) == 1
-            and self.customize_output_token_ids[0] == "4913"
+            and self.customize_output_token_ids[0] == 4913
         ):
             logger.info(
                 "first token generate, add extra tokens. current output tokens: %s",
