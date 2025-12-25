@@ -57,7 +57,9 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger1 = logging.getLogger(__name__)
 
