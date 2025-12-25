@@ -1066,7 +1066,17 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
-        logger1.info("Current Generated Tokens: %s", sampled_token_ids)
+        now = time.time()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        ms = int((now - int(now)) * 1000)
+
+        logger1.info(
+            "[%s.%03d] Current Generated Tokens: %s",
+            ts,
+            ms,
+            sampled_token_ids,
+        )
+        # logger1.info("Current Generated Tokens: %s", sampled_token_ids)
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
