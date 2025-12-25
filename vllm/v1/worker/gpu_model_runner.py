@@ -608,6 +608,8 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
 
+        self.customize_output_token_ids: list = []
+
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
             self.mm_budget.reset_cache()
@@ -3237,6 +3239,53 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        if sampler_output is not None:
+            cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[0][0]
+            self.customize_output_token_ids.append(cur_token_id)
+
+        #
+        if (
+            len(self.customize_output_token_ids) == 1
+            and self.customize_output_token_ids[0] == "4913"
+        ):
+            logger.info(
+                "first token generate, add extra tokens. current output tokens: %s",
+                self.customize_output_token_ids,
+            )
+            sampler_output.sampled_token_ids = torch.tensor(
+                [[4913, 14172, 788, 330]], device="cuda:0", dtype=torch.int32
+            )
+            self.customize_output_token_ids.extend([14172, 788, 330])
+
+        elif self.customize_output_token_ids[-3:] == [455, 11080, 69364]:
+            sampler_output.sampled_token_ids = torch.tensor(
+                [[69364, 2198, 13786, 788, 5212, 8926, 788, 330]],
+                device="cuda:0",
+                dtype=torch.int32,
+            )
+            self.customize_output_token_ids.extend(
+                [2198, 13786, 788, 5212, 8926, 788, 330]
+            )
+            logger.info(
+                "tool name token generated, add extra tokens. current "
+                "output tokens: %s",
+                self.customize_output_token_ids,
+            )
+        elif self.customize_output_token_ids[-4:-1] == [8926, 788, 330]:
+            cur_token_id = self.customize_output_token_ids[-1]
+            sampler_output.sampled_token_ids = torch.tensor(
+                [[cur_token_id, 2198, 35391, 788, 330]],
+                device="cuda:0",
+                dtype=torch.int32,
+            )
+            self.customize_output_token_ids.extend([2198, 35391, 788, 330])
+            logger.info(
+                "city token generated, add extra tokens. current output tokens: %s",
+                self.customize_output_token_ids,
+            )
+        else:
+            ...
 
         self.input_batch.prev_sampled_token_ids = None
 
