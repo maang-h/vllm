@@ -608,7 +608,7 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
 
-        self.customize_output_token_ids: list = []
+        self.customize_output_token_ids: dict = {}
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -3239,53 +3239,18 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-
-        if sampler_output is not None:
-            cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[0][0]
-            self.customize_output_token_ids.append(cur_token_id)
-
         #
-        if (
-            len(self.customize_output_token_ids) == 1
-            and self.customize_output_token_ids[0] == 4913
-        ):
-            logger.info(
-                "first token generate, add extra tokens. current output tokens: %s",
-                self.customize_output_token_ids,
-            )
-            sampler_output.sampled_token_ids = torch.tensor(
-                [[4913, 14172, 788, 330]], device="cuda:0", dtype=torch.int32
-            )
-            self.customize_output_token_ids.extend([14172, 788, 330])
-
-        elif self.customize_output_token_ids[-3:] == [455, 11080, 69364]:
-            sampler_output.sampled_token_ids = torch.tensor(
-                [[69364, 2198, 13786, 788, 5212, 8926, 788, 330]],
-                device="cuda:0",
-                dtype=torch.int32,
-            )
-            self.customize_output_token_ids.extend(
-                [2198, 13786, 788, 5212, 8926, 788, 330]
-            )
-            logger.info(
-                "tool name token generated, add extra tokens. current "
-                "output tokens: %s",
-                self.customize_output_token_ids,
-            )
-        elif self.customize_output_token_ids[-4:-1] == [8926, 788, 330]:
-            cur_token_id = self.customize_output_token_ids[-1]
-            sampler_output.sampled_token_ids = torch.tensor(
-                [[cur_token_id, 2198, 35391, 788, 330]],
-                device="cuda:0",
-                dtype=torch.int32,
-            )
-            self.customize_output_token_ids.extend([2198, 35391, 788, 330])
-            logger.info(
-                "city token generated, add extra tokens. current output tokens: %s",
-                self.customize_output_token_ids,
-            )
-        else:
-            ...
+        updated_tokens = []
+        for i, new_reqs in scheduler_output.scheduled_new_reqs:
+            req_id = new_reqs.req_id
+            cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[0][0]
+            updated_tokens.append(self.customize_speculative(cur_token_id, req_id))
+            if cur_token_id == 151645:
+                del self.customize_output_token_ids[req_id]
+                logger.info("请求 %s 结束了", req_id)
+        sampler_output.sampled_token_ids = torch.tensor(
+            updated_tokens, device="cuda:0", dtype=torch.int32
+        )
 
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3416,6 +3381,43 @@ class GPUModelRunner(
             )
 
         return async_output
+
+    def customize_speculative(self, cur_token_id: int, req_id: str) -> list[int]:
+        if req_id not in self.customize_output_token_ids:
+            self.customize_output_token_ids[req_id]([cur_token_id])
+        else:
+            self.customize_output_token_ids[req_id].append(cur_token_id)
+
+        cur_outputed_tokens = self.customize_output_token_ids[req_id]
+        updated_tokens = [cur_token_id]
+        if len(cur_outputed_tokens) == 1 and cur_outputed_tokens[0] == 4913:
+            logger.info(
+                "first token generate, add extra tokens. current output tokens: %s",
+                self.customize_output_token_ids,
+            )
+            updated_tokens = [4913, 14172, 788, 330]
+            cur_outputed_tokens.extend([14172, 788, 330])
+
+        elif cur_outputed_tokens[-3:] == [455, 11080, 69364]:
+            updated_tokens = [69364, 2198, 13786, 788, 5212, 8926, 788, 330]
+            cur_outputed_tokens.extend([2198, 13786, 788, 5212, 8926, 788, 330])
+            logger.info(
+                "tool name token generated, add extra tokens. current "
+                "output tokens: %s",
+                self.customize_output_token_ids,
+            )
+        elif cur_outputed_tokens[-4:-1] == [8926, 788, 330]:
+            cur_token_id = cur_outputed_tokens[-1]
+            updated_tokens = [cur_token_id, 2198, 35391, 788, 330]
+            cur_outputed_tokens.extend([2198, 35391, 788, 330])
+            logger.info(
+                "city token generated, add extra tokens. current output tokens: %s",
+                self.customize_output_token_ids,
+            )
+        else:
+            ...
+
+        return updated_tokens
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._draft_token_ids is None:
