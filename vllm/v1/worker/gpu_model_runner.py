@@ -3384,7 +3384,7 @@ class GPUModelRunner(
 
     def customize_speculative(self, cur_token_id: int, req_id: str) -> list[int]:
         if req_id not in self.customize_output_token_ids:
-            self.customize_output_token_ids[req_id]([cur_token_id])
+            self.customize_output_token_ids[req_id] = [cur_token_id]
         else:
             self.customize_output_token_ids[req_id].append(cur_token_id)
 
