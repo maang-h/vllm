@@ -3241,11 +3241,10 @@ class GPUModelRunner(
             sampler_output = self._sample(logits, spec_decode_metadata)
         #
         updated_tokens = []
-        for i, new_reqs in scheduler_output.scheduled_new_reqs:
+        for i, new_reqs in enumerate(scheduler_output.scheduled_new_reqs):
             req_id = new_reqs.req_id
             cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[i][0]
             updated_tokens.append(self.customize_speculative(cur_token_id, req_id))
-            logger.info("current token id: %s", cur_token_id)
             if cur_token_id == 151645:
                 del self.customize_output_token_ids[req_id]
                 logger.info("请求 %s 结束了", req_id)
