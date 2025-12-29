@@ -3240,16 +3240,16 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
         #
-        # updated_tokens = []
-        # for i, req_id in enumerate(scheduler_output.num_scheduled_tokens.keys()):
-        #     cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[i][0]
-        #     updated_tokens.append(self.customize_speculative(cur_token_id, req_id))
-        #     if cur_token_id == 151645:
-        #         del self.customize_output_token_ids[req_id]
-        #         logger.info("请求 %s 结束了", req_id)
-        # sampler_output.sampled_token_ids = torch.tensor(
-        #     updated_tokens, device="cuda:0", dtype=torch.int32
-        # )
+        updated_tokens = []
+        for i, req_id in enumerate(scheduler_output.num_scheduled_tokens.keys()):
+            cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[i][0]
+            updated_tokens.append(self.customize_speculative(cur_token_id, req_id))
+            if cur_token_id == 151645:
+                del self.customize_output_token_ids[req_id]
+                logger.info("请求 %s 结束了", req_id)
+        sampler_output.sampled_token_ids = torch.tensor(
+            updated_tokens, device="cuda:0", dtype=torch.int32
+        )
 
         self.input_batch.prev_sampled_token_ids = None
 
