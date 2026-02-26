@@ -130,12 +130,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
 
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_tensor_model_parallel_world_size()  # Tensor parallel   一般是GPU数量
 
-        self.ep_group = get_ep_group().device_group
-        self.ep_rank = get_ep_group().rank_in_group
-        self.ep_size = self.ep_group.size()
-        self.n_routed_experts = config.num_experts
+        self.ep_group = get_ep_group().device_group  # 分配用于专家执行的设备组（分配多少个GPU用于专家执行）
+        self.ep_rank = get_ep_group().rank_in_group  # 组中的序号（当前是第几个GPU）
+        self.ep_size = self.ep_group.size()  # 当前专家执行的GPU数量
+        self.n_routed_experts = config.num_experts  # 路由专家的数量
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
@@ -343,7 +343,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
-        mlp_only_layers = (
+        mlp_only_layers = (  # getattr(config, "mlp_only_layers", [])
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
         if (layer_idx not in mlp_only_layers) and (
@@ -654,7 +654,7 @@ class Qwen3MoeForCausalLM(
         self.quant_config = quant_config
         # Only perform the following mapping when Qwen3MoeMLP exists
         if getattr(config, "mlp_only_layers", []):
-            self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+            self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]   # TODO(@me): 这里的gate_up_proj会存在嘛？什么时候加入的？
         self.model = Qwen3MoeModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -719,7 +719,7 @@ class Qwen3MoeForCausalLM(
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
+        return (2, num_layers // 2, num_layers - 3)  # TODO(@me) 元组类型不需要加括号
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

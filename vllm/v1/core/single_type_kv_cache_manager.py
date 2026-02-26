@@ -92,7 +92,7 @@ class SingleTypeKVCacheManager(ABC):
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
 
-        if request_id in self.num_cached_block:
+        if request_id in self.num_cached_block:  # decoding阶段
             # Fast-path: a running request won't have any new prefix-cache hits.
             assert len(new_computed_blocks) == 0
             # NOTE: With speculative decoding, request's blocks may be allocated

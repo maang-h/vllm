@@ -53,7 +53,7 @@ def get_rope(
     else:
         dual_chunk_attention_args = None
 
-    rope_parameters = rope_parameters or {}
+    rope_parameters = rope_parameters or {}  # TODO(@me) 上边有过判断，可直接在上面else中赋值空字典
     base = rope_parameters.get("rope_theta", 10000)
     scaling_type = rope_parameters.get("rope_type", "default")
     partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)

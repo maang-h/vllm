@@ -498,6 +498,12 @@ class LayerFn(Protocol):
 
 class PPMissingLayer(torch.nn.Identity):
     """
+    占位符层：这是一个用于管道并行（Pipeline Parallelism）模型中的占位符层。
+            在管道并行中，模型被分割到多个GPU上，但为了保持模型结构的一致性，不在当前GPU上的层需要用占位符代替。
+    继承自Identity：继承自torch.nn.Identity，这意味着它本质上是一个"恒等层"，直接将输入传递给输出，不做任何变换
+
+    在前向传播时不做任何计算，只传递参数
+
     A placeholder layer for missing layers in a pipeline parallel model.
     """
 
@@ -598,6 +604,7 @@ def make_layers(
     from vllm.distributed.utils import get_pp_indices
 
     start_layer, end_layer = get_pp_indices(
+        # 32  0  1
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
     modules = torch.nn.ModuleList(

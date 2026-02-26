@@ -97,12 +97,12 @@ def apply_penalties(
 
 
 def default_unquantized_gemm(
-    layer: torch.nn.Module,
+    layer: torch.nn.Module,  # TODO: remove it
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
-    return torch.nn.functional.linear(x, weight, bias)
+    return torch.nn.functional.linear(x, weight, bias)  # x @ weight.t() + bias  -- x点乘weight的转置 + bias
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):

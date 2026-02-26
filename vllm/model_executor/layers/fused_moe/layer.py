@@ -1,155 +1,231 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterable
-from contextlib import nullcontext
-from enum import Enum
-from typing import Literal, cast, get_args, overload
+"""
+FusedMoE Layer 实现 - vLLM中Mixture of Experts (MoE) 模型的融合层实现
 
-import torch
-import torch.nn.functional as F
-from torch.nn.parameter import UninitializedParameter
+这个模块实现了高效的MoE计算，包括：
+1. 专家选择（Top-K路由）
+2. 专家权重管理和加载
+3. 多种并行策略支持（TP, EP, DP, PP）
+4. 量化支持（FP8, INT8, INT4等）
+5. 专家负载均衡（EPLB）
 
-import vllm.envs as envs
-from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.config.parallel import ExpertPlacementStrategy
-from vllm.distributed import (
-    get_dp_group,
-    get_ep_group,
-    get_pcp_group,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
+核心类：FusedMoE - 包含多个专家MLP网络的融合层
+"""
+
+from collections.abc import Callable, Iterable  # 可调用对象和可迭代对象类型提示 - 用于函数签名和迭代器类型标注
+from contextlib import nullcontext  # 空上下文管理器 - 提供一个什么都不做的上下文管理器，用于条件性地应用上下文
+from enum import Enum  # 枚举类型基类 - 用于定义枚举常量（如权重缩放支持类型）
+from typing import Literal, cast, get_args, overload  # 类型提示工具 - 用于更精确的类型标注和重载
+
+import torch  # PyTorch核心库 - 深度学习框架的核心功能
+import torch.nn.functional as F  # PyTorch函数式API - 提供激活函数、填充等操作
+from torch.nn.parameter import UninitializedParameter  # 未初始化的参数 - 用于GGUF等延迟初始化场景
+
+import vllm.envs as envs  # vLLM环境变量配置 - 提供各种运行时配置选项（如MoE chunk size）
+from vllm._aiter_ops import rocm_aiter_ops  # ROCm (AMD GPU) 的AITER操作支持 - AMD GPU上的优化MoE kernel
+from vllm.config import VllmConfig, get_current_vllm_config  # vLLM配置管理 - 获取全局配置对象
+from vllm.config.parallel import ExpertPlacementStrategy  # 专家放置策略 - "linear"或"round_robin"两种方式分配专家到GPU
+from vllm.distributed import (  # 分布式通信相关工具 - 多GPU并行计算的核心支持
+    get_dp_group,  # 获取数据并行组 - Data Parallelism组，用于在不同batch数据间并行
+    get_ep_group,  # 获取专家并行组 - Expert Parallelism组，将专家分散到不同GPU
+    get_pcp_group,  # 获取部分上下文并行组 - Partial Context Parallelism组，处理超长序列
+    get_tensor_model_parallel_world_size,  # 获取张量并行世界大小 - 参与TP的GPU总数
+    tensor_model_parallel_all_reduce,  # 张量并行的all-reduce操作 - 在TP组内聚合结果
 )
-from vllm.distributed.eplb.eplb_state import EplbState
-from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.logger import init_logger
-from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEParallelConfig,
-    FusedMoEQuantConfig,
-    RoutingMethodType,
+from vllm.distributed.eplb.eplb_state import EplbState  # 专家并行负载均衡状态管理 - 管理冗余专家和负载统计
+from vllm.forward_context import ForwardContext, get_forward_context  # 前向传播上下文 - 存储当前forward pass的元数据
+from vllm.logger import init_logger  # 日志初始化器 - 创建模块级logger实例
+from vllm.model_executor.custom_op import CustomOp  # 自定义算子基类 - 支持torch.compile的自定义操作
+from vllm.model_executor.layers.fused_moe.config import (  # MoE配置类 - 定义MoE层的各种配置参数
+    FusedMoEConfig,  # MoE层配置 - 包含专家数、hidden_dim等
+    FusedMoEParallelConfig,  # 并行配置 - TP/EP/DP的配置信息
+    FusedMoEQuantConfig,  # 量化配置 - FP8/INT8等量化方案配置
+    RoutingMethodType,  # 路由方法类型 - Softmax、Sigmoid、TopK等不同路由策略
 )
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-    init_aiter_topK_meta_data,
+    init_aiter_topK_meta_data,  # 初始化AITER TopK元数据 - ROCm平台的专家选择元数据
 )
-from vllm.model_executor.layers.fused_moe.routing_simulator import RoutingSimulator
+from vllm.model_executor.layers.fused_moe.routing_simulator import RoutingSimulator  # 路由模拟器 - 用于测试不同路由策略
 from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
+    QuantizationConfig,  # 量化配置基类 - 所有量化方案的基础接口
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-    is_flashinfer_supporting_global_sf,
+    is_flashinfer_supporting_global_sf,  # 检查FlashInfer是否支持全局缩放因子 - 用于某些量化方案
 )
-from vllm.platforms import current_platform
-from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
-from vllm.utils.math_utils import cdiv, round_up
+from vllm.platforms import current_platform  # 当前平台检测 - 区分CUDA/ROCm/TPU/CPU等平台
+from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe  # 检查是否有FlashInfer TRT-LLM MoE kernel
+from vllm.utils.math_utils import cdiv, round_up  # 数学工具 - ceil除法和向上取整
 from vllm.utils.torch_utils import (
-    aux_stream,
-    current_stream,
-    direct_register_custom_op,
+    aux_stream,  # 获取辅助CUDA stream - 用于shared experts的并行执行
+    current_stream,  # 获取当前CUDA stream - 主计算流
+    direct_register_custom_op,  # 直接注册自定义算子 - 支持torch.compile
 )
-from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id  # 获取当前microbatch ID - DBO (Dynamic Batch Orchestration) 支持
 
-if current_platform.is_cuda_alike():
-    from .fused_moe import eplb_map_to_physical_and_record
-else:
+# 平台特定的EPLB (Expert Parallel Load Balancing) 函数
+if current_platform.is_cuda_alike():  # CUDA/ROCm平台 - 使用原生CUDA kernel
+    from .fused_moe import eplb_map_to_physical_and_record  # 将逻辑专家ID映射到物理ID并记录负载
+else:  # CPU或其他平台 - 使用Python fallback
 
     def _eplb_map_to_physical_and_record(
-        topk_ids: torch.Tensor,
-        expert_load_view: torch.Tensor,
-        logical_to_physical_map: torch.Tensor,
-        logical_replica_count: torch.Tensor,
+        topk_ids: torch.Tensor,  # Top-K选中的专家ID (逻辑ID)
+        expert_load_view: torch.Tensor,  # 专家负载视图 - 记录每个专家的使用情况
+        logical_to_physical_map: torch.Tensor,  # 逻辑到物理专家的映射表
+        logical_replica_count: torch.Tensor,  # 每个逻辑专家的副本数量
     ) -> torch.Tensor:
         # CPU fallback: no EPLB so just return as is
+        # CPU回退：不支持EPLB，直接返回原始ID
         return topk_ids
 
     eplb_map_to_physical_and_record = _eplb_map_to_physical_and_record
-from vllm.model_executor.layers.fused_moe.fused_moe import GroupedTopk
 
-if current_platform.is_tpu():
-    from .moe_pallas import fused_moe as fused_moe_pallas
+from vllm.model_executor.layers.fused_moe.fused_moe import GroupedTopk  # 分组TopK路由 - DeepSeek等模型使用
+
+# TPU平台特定实现
+if current_platform.is_tpu():  # Google TPU - 使用Pallas实现
+    from .moe_pallas import fused_moe as fused_moe_pallas  # TPU上的MoE实现
 else:
-    fused_moe_pallas = None  # type: ignore
+    fused_moe_pallas = None  # type: ignore  # 其他平台不使用
 
+# MoE方法基类和实现
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-    FusedMoEMethodBase,
+    FusedMoEMethodBase,  # MoE方法基类 - 定义apply等接口
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
-    FusedMoEModularMethod,
+    FusedMoEModularMethod,  # 模块化MoE方法 - 支持DeepEP等高级backend
 )
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-    UnquantizedFusedMoEMethod,
+    UnquantizedFusedMoEMethod,  # 未量化MoE方法 - 标准FP16/BF16计算
 )
 
-logger = init_logger(__name__)
+logger = init_logger(__name__)  # 创建模块级日志记录器
 
 
 class FusedMoeWeightScaleSupported(Enum):
-    TENSOR = "tensor"
-    CHANNEL = "channel"
-    GROUP = "group"
-    BLOCK = "block"
+    """
+    MoE权重缩放支持的类型枚举
+    
+    用于标识量化时权重缩放因子的粒度：
+    - TENSOR: 每个tensor一个缩放因子（per-tensor quantization）
+    - CHANNEL: 每个通道一个缩放因子（per-channel quantization）
+    - GROUP: 每组元素一个缩放因子（group quantization，如GPTQ）
+    - BLOCK: 每个块一个缩放因子（block quantization，如DeepSeek的128x128块）
+    """
+    TENSOR = "tensor"    # 张量级缩放 - 整个权重矩阵共享一个缩放因子
+    CHANNEL = "channel"  # 通道级缩放 - 每个输出通道有独立缩放因子
+    GROUP = "group"      # 组级缩放 - 如GPTQ的128元素一组
+    BLOCK = "block"      # 块级缩放 - 如DeepSeek的128x128块
 
 
 def determine_expert_map(
-    ep_size: int,
-    ep_rank: int,
-    global_num_experts: int,
-    expert_placement_strategy: ExpertPlacementStrategy = "linear",
-    num_fused_shared_experts: int = 0,
-    return_expert_mask: bool = False,
+    ep_size: int,  # 专家并行组的大小（参与EP的GPU数量）
+    ep_rank: int,  # 当前进程在专家并行组中的排名（0到ep_size-1）
+    global_num_experts: int,  # 模型中专家的总数量（全局）
+    expert_placement_strategy: ExpertPlacementStrategy = "linear",  # 专家放置策略："linear"或"round_robin"
+    num_fused_shared_experts: int = 0,  # 融合的共享专家数量（用于某些模型如DeepSeekV2）
+    return_expert_mask: bool = False,  # 是否返回expert_mask（AITER ROCm backend需要）
 ) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
     """
-    Calculates how many experts should be assigned to each rank for EP and
-    creates a mapping from global to local expert index. Experts are
-    distributed evenly across ranks. Any remaining are assigned to the
-    last rank.
-
+    计算在专家并行(EP)场景下，应该为每个rank分配多少专家，
+    并创建从全局专家索引到本地专家索引的映射。
+    
+    核心思想：将专家尽可能均匀地分配到各个GPU上。
+    
     Args:
-        ep_size: The size of the expert parallel group
-        ep_rank: The rank of the current process in the expert parallel
-            group
-        global_num_experts: The total number of experts in the model.
-        expert_placement_strategy: The expert placement strategy.
+        ep_size: 专家并行组的大小（参与EP的GPU数量）
+        ep_rank: 当前进程在专家并行组中的排名（0-based索引）
+        global_num_experts: 模型中专家的总数量
+        expert_placement_strategy: 专家放置策略
+            - "linear": 线性分配，连续的专家分配给同一GPU
+            - "round_robin": 轮询分配，专家交替分配给不同GPU
+        num_fused_shared_experts: 融合的共享专家数量（AITER MOE使用）
+        return_expert_mask: 是否返回expert_mask（ROCm AITER需要）
 
     Returns:
-        tuple[int, Optional[torch.Tensor]]: A tuple containing:
-            - local_num_experts (int): The number of experts assigned
-                to the current rank.
-            - expert_map (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts,) mapping from global to local index.
-                Contains -1 for experts not assigned to the current rank.
-                Returns None if ep_size is 1.
-            - expert_mask (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts + num_fused_shared_experts + 1,)
-                containing 1 for experts assigned to the current rank
-                and 0 for sentinel.
-                Returns None if ep_size is 1.
-                Used only when AITER MOE is enabled.
+        tuple[int, Optional[torch.Tensor], Optional[torch.Tensor]]: 包含三个元素的元组：
+            - local_num_experts (int): 分配给当前rank的专家数量
+            - expert_map (Optional[torch.Tensor]): 形状为(global_num_experts,)的张量
+                从全局索引映射到本地索引，未分配给当前rank的专家标记为-1
+                如果ep_size=1则返回None（无需映射）
+            - expert_mask (Optional[torch.Tensor]): 形状为
+                (global_num_experts + num_fused_shared_experts + 1,)的张量
+                分配给当前rank的专家标记为1，sentinel标记为0
+                仅在AITER MOE启用时使用，否则返回None
+    
+    示例1 - Linear策略，64个专家，4个GPU：
+        ep_size=4, global_num_experts=64
+        每个GPU分配: 64 // 4 = 16个专家
+        
+        GPU 0 (ep_rank=0): 专家 0-15   (local_num_experts=16)
+        GPU 1 (ep_rank=1): 专家 16-31  (local_num_experts=16)
+        GPU 2 (ep_rank=2): 专家 32-47  (local_num_experts=16)
+        GPU 3 (ep_rank=3): 专家 48-63  (local_num_experts=16)
+        
+        GPU 0的expert_map: [0,1,2,...,15, -1,-1,...,-1]
+                          ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+                          本地专家0-15    未分配专家
+    
+    示例2 - Linear策略，65个专家，4个GPU（不能整除）：
+        ep_size=4, global_num_experts=65
+        base_experts = 65 // 4 = 16
+        remainder = 65 % 4 = 1
+        
+        GPU 0 (ep_rank=0): 专家 0-16   (17个，因为rank < remainder)
+        GPU 1 (ep_rank=1): 专家 17-32  (16个)
+        GPU 2 (ep_rank=2): 专家 33-48  (16个)
+        GPU 3 (ep_rank=3): 专家 49-64  (16个)
+    
+    示例3 - Round-Robin策略，8个专家，2个GPU：
+        ep_size=2, global_num_experts=8
+        
+        GPU 0 (ep_rank=0): 专家 0,2,4,6 (本地索引0,1,2,3)
+        GPU 1 (ep_rank=1): 专家 1,3,5,7 (本地索引0,1,2,3)
+        
+        GPU 0的expert_map: [0,-1,1,-1,2,-1,3,-1]
+                          ^   ^   ^   ^   ^
+                          本  无  本  无  本
     """
-    assert ep_size > 0
-    if ep_size == 1:
+    assert ep_size > 0  # 确保EP组大小为正数
+    if ep_size == 1:  # 如果只有1个GPU（无EP）
+        # 无需专家映射，所有专家都在本地
         return (global_num_experts, None, None)
 
     # Distribute experts as evenly as possible to each rank.
-    base_experts = global_num_experts // ep_size
-    remainder = global_num_experts % ep_size
+    # 将专家尽可能均匀地分配给每个rank
+    # 算法：先每个rank分配base_experts个，剩余的分配给前remainder个rank
+    base_experts = global_num_experts // ep_size  # 每个rank的基础专家数量
+    remainder = global_num_experts % ep_size      # 无法整除的剩余专家数量
+    # 如果当前rank在前remainder个rank中，则多分配一个专家
     local_num_experts = base_experts + 1 if ep_rank < remainder else base_experts
 
     # Create a tensor of size num_experts filled with -1
+    # 创建一个大小为num_experts的张量，初始值全部为-1
+    # -1表示该全局专家ID未分配给当前rank
     expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
+    
     # Create an expert map for the local experts
-    if expert_placement_strategy == "linear":
+    # 为本地专家创建映射关系
+    if expert_placement_strategy == "linear":  # 线性分配策略
+        # 计算当前rank的专家起始索引
+        # 前ep_rank个rank每个有base_experts+1或base_experts个专家
+        # 所以起始位置 = ep_rank * base_experts + min(ep_rank, remainder)
+        # 示例：64专家,4GPU,remainder=0 -> rank0从0开始,rank1从16开始,rank2从32开始
         start_idx = ep_rank * base_experts + min(ep_rank, remainder)
+        # 将连续的local_num_experts个全局索引映射到本地索引0,1,2,...
         expert_map[start_idx : start_idx + local_num_experts] = torch.arange(
             0, local_num_experts, dtype=torch.int32
         )
-    elif expert_placement_strategy == "round_robin":
+    elif expert_placement_strategy == "round_robin":  # 轮询分配策略
+        # 以轮询方式分配专家：rank0得0,4,8...; rank1得1,5,9...; rank2得2,6,10...
+        # 生成当前rank负责的全局专家ID序列
+        # 示例：8专家,2GPU,rank0 -> [0,2,4,6], rank1 -> [1,3,5,7]
         local_log_experts = torch.arange(
             ep_rank, global_num_experts, ep_size, dtype=torch.int32
         )
 
+        # 将这些全局ID映射到本地索引0,1,2,...
         expert_map[local_log_experts] = torch.arange(
             0, local_num_experts, dtype=torch.int32
         )
@@ -160,20 +236,25 @@ def determine_expert_map(
             f"{get_args(ExpertPlacementStrategy)}"
         )
 
-    expert_mask = None
-    if return_expert_mask:
+    expert_mask = None  # 初始化expert_mask为None
+    if return_expert_mask:  # 如果需要返回mask（AITER MOE使用）
+        # 创建mask张量：1表示分配给当前rank，0表示未分配或sentinel
+        # 大小包括：路由专家 + 共享专家 + 1个sentinel位置
         expert_mask = torch.ones(
             (global_num_experts + num_fused_shared_experts + 1,), dtype=torch.int32
         )
-        expert_mask[-1] = 0
+        expert_mask[-1] = 0  # 最后一位是sentinel，标记为0
+        # 前global_num_experts位根据expert_map设置：有映射(>-1)则为1，否则为0
         expert_mask[:global_num_experts] = expert_map > -1
+        # 将共享专家的本地索引追加到expert_map中
+        # 共享专家的本地ID从local_num_experts开始
         expert_map = torch.cat(
             (
-                expert_map,
+                expert_map,  # 原有的路由专家映射
                 torch.tensor(
                     [local_num_experts + i for i in range(num_fused_shared_experts)],
                     dtype=torch.int32,
-                ),
+                ),  # 共享专家的本地索引
             ),
             dim=0,
         )
@@ -182,29 +263,64 @@ def determine_expert_map(
 
 
 def determine_expert_placement_strategy(
-    expert_placement_strategy: ExpertPlacementStrategy,
-    moe_parallel_config: FusedMoEParallelConfig,
-    num_expert_group: int | None,
-    num_redundant_experts: int,
-    enable_eplb: bool,
+    expert_placement_strategy: ExpertPlacementStrategy,  # 用户请求的放置策略
+    moe_parallel_config: FusedMoEParallelConfig,  # MoE并行配置
+    num_expert_group: int | None,  # 专家组数量（DeepSeek模型使用）
+    num_redundant_experts: int,  # 冗余专家数量（EPLB使用）
+    enable_eplb: bool,  # 是否启用专家并行负载均衡
 ) -> ExpertPlacementStrategy:
-    if expert_placement_strategy == "round_robin":
+    """
+    确定最终使用的专家放置策略，如果请求的策略不支持则回退到linear。
+    
+    Round-robin策略的限制条件：
+    1. 必须有多个专家组（num_expert_group > 1）
+    2. 不能有冗余专家（num_redundant_experts == 0）
+    3. 不能启用EPLB（enable_eplb == False）
+    4. 如果使用all2all kernels，必须是DeepEP low-latency backend
+    
+    Args:
+        expert_placement_strategy: 用户请求的策略 ("linear"或"round_robin")
+        moe_parallel_config: MoE并行配置对象
+        num_expert_group: 专家组数量，None表示无分组
+        num_redundant_experts: 冗余专家数量（EPLB特性）
+        enable_eplb: 是否启用负载均衡
+    
+    Returns:
+        ExpertPlacementStrategy: 最终确定的策略，可能回退到"linear"
+    
+    示例：
+        # 场景1：DeepSeekV2-Lite，有8个专家组，要求round-robin
+        num_expert_group=8, num_redundant_experts=0, enable_eplb=False
+        -> 返回"round_robin" ✅ 支持
+        
+        # 场景2：普通MoE，无专家组，要求round-robin
+        num_expert_group=None, num_redundant_experts=0, enable_eplb=False
+        -> 返回"linear" ❌ 不支持（无专家组），回退
+        
+        # 场景3：启用EPLB，要求round-robin
+        num_expert_group=8, num_redundant_experts=2, enable_eplb=True
+        -> 返回"linear" ❌ 不支持（EPLB与round-robin不兼容），回退
+    """
+    if expert_placement_strategy == "round_robin":  # 如果请求round-robin策略
+        # 检查是否满足round-robin的所有前提条件
         round_robin_supported = (
-            (num_expert_group is not None and num_expert_group > 1)
-            and num_redundant_experts == 0
-            and not enable_eplb
+            (num_expert_group is not None and num_expert_group > 1)  # 条件1：必须有多个专家组
+            and num_redundant_experts == 0  # 条件2：不能有冗余专家
+            and not enable_eplb  # 条件3：不能启用EPLB
         )
 
-        if not round_robin_supported:
+        if not round_robin_supported:  # 如果不满足前提条件
             logger.warning(
                 "Round-robin expert placement is only supported for "
                 "models with multiple expert groups and no redundant "
                 "experts. Falling back to linear expert placement."
             )
-            return "linear"
+            return "linear"  # 回退到linear策略
+            
+        # 检查all2all backend兼容性
         if (
-            moe_parallel_config.use_all2all_kernels
-            and not moe_parallel_config.use_deepep_ll_kernels
+            moe_parallel_config.use_all2all_kernels  # 如果使用all2all kernels
+            and not moe_parallel_config.use_deepep_ll_kernels  # 但不是DeepEP-LL backend
         ):
             logger.warning(
                 "Round-robin expert placement currently only supports "
@@ -212,26 +328,42 @@ def determine_expert_placement_strategy(
                 "Falling back to linear expert placement.",
                 moe_parallel_config.all2all_backend,
             )
-            return "linear"
+            return "linear"  # 回退到linear策略
 
-    return expert_placement_strategy
+    return expert_placement_strategy  # 返回原策略（可能是linear或通过检查的round-robin）
 
 
 def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
     """
-    Compresses the expert map by removing any -1 entries.
+    压缩专家映射表，移除所有-1条目，生成本地到全局索引的映射字符串。
+    
+    这个函数用于日志记录，将expert_map压缩成易读的字符串格式。
+    使用字符串支持哈希，确保同样的映射只记录一次日志。
 
     Args:
-        expert_map (torch.Tensor): A tensor of shape (global_num_experts,)
-            mapping from global to local index. Contains -1 for experts not
-            assigned to the current rank.
+        expert_map (torch.Tensor): 形状为(global_num_experts,)的张量
+            从全局索引映射到本地索引，-1表示未分配给当前rank的专家
 
     Returns:
-        str: A string mapping from local to global index.
-            Using str to support hashing for logging once only.
+        str: 本地索引到全局索引的映射字符串
+            格式："本地索引0->全局索引X, 本地索引1->全局索引Y, ..."
+    
+    示例：
+        # GPU 0有expert_map = [0, 1, 2, -1, -1, -1, -1, -1]
+        # 表示全局专家0,1,2映射到本地专家0,1,2，其他专家不在此GPU
+        get_compressed_expert_map(expert_map)
+        -> "0->0, 1->1, 2->2"
+        
+        # GPU 1在round-robin下有expert_map = [-1, 0, -1, 1, -1, 2, -1, 3]
+        # 表示全局专家1,3,5,7映射到本地专家0,1,2,3
+        get_compressed_expert_map(expert_map)
+        -> "0->1, 1->3, 2->5, 3->7"
     """
+    # 找出所有非-1的位置（即分配给当前rank的专家的全局索引）
     global_indices = torch.where(expert_map != -1)[0]
+    # 获取这些位置对应的本地索引
     local_indices = expert_map[global_indices]
+    # 构建 "本地索引->全局索引" 的映射字符串
     return ", ".join(
         f"{local_index.item()}->{global_index.item()}"
         for local_index, global_index in zip(local_indices, global_indices)
@@ -293,301 +425,525 @@ def maybe_roundup_hidden_size(
     return hidden_size
 
 
-@CustomOp.register("fused_moe")
+@CustomOp.register("fused_moe")  # 注册为自定义算子，支持torch.compile
 class FusedMoE(CustomOp):
-    """FusedMoE layer for MoE models.
+    """
+    FusedMoE层 - 用于MoE（Mixture of Experts）模型的融合层实现。
+    
+    这个层包含了专家的所有权重，并提供高效的MoE计算：
+    1. MergedColumnParallel权重 (gate_up_proj / w13) - 门控和上投影合并
+    2. RowParallelLinear权重 (down_proj / w2) - 下投影
+    
+    权重命名约定：
+    - w1: gate_proj (门控投影)
+    - w2: down_proj (下投影)  
+    - w3: up_proj (上投影)
+    - w13: w1和w3合并的权重
+    
+    注意：Mixtral等模型使用w1/w2/w3命名。我们在这里采用这个约定，
+    并在每个模型实现的load_weights函数中处理任何必要的重映射。
 
-    This layer contains both MergedColumnParallel weights (gate_up_proj /
-    w13) and RowParallelLinear weights (down_proj/ w2).
-
-    Note: Mixtral uses w1, w2, and w3 for gate, up, and down_proj. We
-    copy that naming convention here and handle any remapping in the
-    load_weights function in each model implementation.
-
-    Args:
-        num_experts: Number of experts in the model
-        top_k: Number of experts selected for each token
-        hidden_size: Input hidden state size of the transformer
-        intermediate_size: Intermediate size of the experts
-        params_dtype: Data type for the parameters.
-        reduce_results: Whether to all_reduce on the output of the layer
-        renormalize: Whether to renormalize the logits in the fused_moe kernel
-        quant_config: Quantization configure.
-        enable_eplb: Whether to enable expert parallelism load balancer.
+    主要参数说明：
+        num_experts: 模型中专家的数量（不包括冗余专家）
+        top_k: 每个token选择的专家数量（如Top-2、Top-4）
+        hidden_size: Transformer的输入隐藏状态大小
+        intermediate_size: 专家的中间层大小（通常是hidden_size的4倍）
+        params_dtype: 参数的数据类型（如torch.float16、torch.bfloat16）
+        reduce_results: 是否在层输出上执行all_reduce（TP/EP并行时）  # all_reduce是什么？？
+        renormalize: 是否在fused_moe kernel中重新归一化logits
+        quant_config: 量化配置（支持FP8、INT8、INT4等）
+        enable_eplb: 是否启用专家并行负载均衡器（EPLB）
+    
+    核心功能：
+    1. 专家选择：根据router logits选择Top-K专家
+    2. 专家计算：并行计算选中的专家输出
+    3. 结果融合：加权聚合各专家输出
+    4. 负载均衡：通过EPLB优化专家利用率
+    
+    支持的并行策略：
+    - TP (Tensor Parallelism): 张量并行
+    - EP (Expert Parallelism): 专家并行
+    - DP (Data Parallelism): 数据并行
+    - PP (Pipeline Parallelism): 流水线并行（通过模型级支持）
+    - SP (Sequence Parallelism): 序列并行
     """
 
     def __init__(
         self,
-        num_experts: int,  # Global number of experts
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        params_dtype: torch.dtype | None = None,
-        reduce_results: bool = False,
-        renormalize: bool = True,
-        use_grouped_topk: bool = False,
-        num_expert_group: int | None = None,
-        topk_group: int | None = None,
-        quant_config: QuantizationConfig | None = None,
-        tp_size: int | None = None,
-        ep_size: int | None = None,
-        dp_size: int | None = None,
-        pcp_size: int | None = None,
-        prefix: str = "",
-        custom_routing_function: Callable | None = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: torch.Tensor | None = None,
-        apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
-        is_act_and_mul: bool = True,
-        enable_eplb: bool = False,
-        num_redundant_experts: int = 0,
-        has_bias: bool = False,
-        is_sequence_parallel=False,
-        expert_mapping: list[tuple[str, str, int, str]] | None = None,
-        n_shared_experts: int | None = None,
-        routing_method_type: int | None = None,
+        num_experts: int,  # 全局专家数量（逻辑专家数，不含冗余专家）
+        top_k: int,  # 每个token选择的专家数量（如2表示Top-2路由）
+        hidden_size: int,  # 隐藏层维度（输入/输出维度）
+        intermediate_size: int,  # 中间层维度（FFN的放大倍数，通常4倍hidden_size） FFN intermediate size mlp中上投影的维度
+        params_dtype: torch.dtype | None = None,  # 参数数据类型（如fp16/bf16，None则使用默认）
+        reduce_results: bool = False,  # 是否在输出时all_reduce（TP/EP时可能需要）
+        renormalize: bool = True,  # 是否重新归一化专家权重（softmax后的Top-K权重）
+        use_grouped_topk: bool = False,  # 是否使用分组TopK（DeepSeekV2/V3特性）
+        num_expert_group: int | None = None,  # 专家组数量（分组TopK时使用）
+        topk_group: int | None = None,  # 每组选择的专家数（分组TopK时使用）
+        quant_config: QuantizationConfig | None = None,  # 量化配置（FP8/INT8/INT4等）
+        tp_size: int | None = None,  # 张量并行大小（None则自动获取）
+        ep_size: int | None = None,  # 专家并行大小（None则自动获取）
+        dp_size: int | None = None,  # 数据并行大小（None则自动获取）
+        pcp_size: int | None = None,  # 部分上下文并行大小（处理超长序列）
+        prefix: str = "",  # 层名称前缀（用于日志和权重加载）
+        custom_routing_function: Callable | None = None,  # 自定义路由函数（可覆盖默认TopK）
+        scoring_func: str = "softmax",  # 评分函数类型："softmax"或"sigmoid"
+        routed_scaling_factor: float = 1.0,  # 路由权重的缩放因子（某些模型使用）
+        e_score_correction_bias: torch.Tensor | None = None,  # 专家分数修正偏置（DeepSeek使用）
+        apply_router_weight_on_input: bool = False,  # 是否在输入上应用路由权重
+        activation: str = "silu",  # 激活函数类型（默认SiLU，即Swish）
+        is_act_and_mul: bool = True,  # 是否使用激活-乘法融合（SiluAndMul，大多数模型）
+        enable_eplb: bool = False,  # 是否启用专家并行负载均衡（动态专家分配）
+        num_redundant_experts: int = 0,  # 冗余专家数量（EPLB特性，用于负载均衡）
+        has_bias: bool = False,  # 专家MLP是否有bias项
+        is_sequence_parallel=False,  # 是否启用序列并行（在TP基础上切分序列）
+        expert_mapping: list[tuple[str, str, int, str]] | None = None,  # 专家权重映射表（用于权重加载）
+        n_shared_experts: int | None = None,  # 共享专家数量（DeepSeekV2等模型）
+        routing_method_type: int | None = None,  # 路由方法类型（None则根据scoring_func推断）
     ):
-        super().__init__()
+        super().__init__()  # 初始化CustomOp基类
 
+        # ============================================================
+        # 1. 设置Shared Experts的独立CUDA Stream
+        # ============================================================
+        # 目的：让共享专家和路由专家并行执行，提高吞吐量
+        # 原理：使用独立stream，在路由专家计算时同时计算共享专家
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
-        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
+        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:  # 环境变量控制是否禁用
             logger.debug_once("Disabling MoE shared_experts cuda stream", scope="local")
-            self.shared_experts_stream = None
+            self.shared_experts_stream = None  # 禁用独立stream
         else:
             # TODO(rob): enable shared expert overlap with non-cuda-alike.
             # aux_stream() returns None on non-cuda-alike platforms.
-            self.shared_experts_stream = aux_stream()
-            if self.shared_experts_stream is not None:
+            self.shared_experts_stream = aux_stream()  # 获取辅助CUDA stream
+            if self.shared_experts_stream is not None:  # 如果成功获取（CUDA平台）
                 logger.debug_once(
                     "Enabled separate cuda stream for MoE shared_experts", scope="local"
                 )
 
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
+        # ============================================================
+        # 2. 设置参数数据类型
+        # ============================================================
+        if params_dtype is None:  # 如果未指定
+            params_dtype = torch.get_default_dtype()  # 使用PyTorch默认类型（通常fp32）
+        self.params_dtype = params_dtype  # 保存参数类型（权重的存储类型）
 
-        vllm_config = get_current_vllm_config()
-        self.vllm_config = vllm_config
+        # ============================================================
+        # 3. 获取vLLM全局配置
+        # ============================================================
+        vllm_config = get_current_vllm_config()  # 获取全局配置对象
+        self.vllm_config = vllm_config  # 保存配置引用
 
+        # ============================================================
+        # 4. 推断MoE输入激活值的数据类型
+        # ============================================================
+        # 关键：激活值类型 ≠ 参数类型（激活值通常不量化）
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
         # operation is typically unquantized (i.e. float16/bfloat16).
-        if vllm_config.model_config is not None:
-            moe_in_dtype = vllm_config.model_config.dtype
+        if vllm_config.model_config is not None:  # 正常情况
+            moe_in_dtype = vllm_config.model_config.dtype  # 从模型配置获取（如fp16/bf16）
         else:
             # TODO (bnell): This is a hack to get test_mixtral_moe to work
             # since model_config is not set in the pytest test.
-            moe_in_dtype = params_dtype
+            moe_in_dtype = params_dtype  # 测试时的fallback
 
+        # ============================================================
+        # 5. 确定各种并行策略的大小
+        # ============================================================
+        # 如果未指定则从分布式组自动获取
         tp_size_ = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
-        )
+        )  # 张量并行度：将模型权重切分到多个GPU
+        # 示例：权重[1024,4096]，TP=4 -> 每GPU持有[1024,1024]
+        
         dp_size_ = dp_size if dp_size is not None else get_dp_group().world_size
+        # 数据并行度：不同GPU处理不同batch数据
+        # 示例：batch=32，DP=2 -> 每GPU处理16个样本
+        
         pcp_size_ = pcp_size if pcp_size is not None else get_pcp_group().world_size
+        # 部分上下文并行度：将超长序列切分到多个GPU
+        # 示例：序列长度8192，PCP=2 -> 每GPU处理4096个token
 
-        self.is_sequence_parallel = is_sequence_parallel
+        # ============================================================
+        # 6. 设置序列并行
+        # ============================================================
+        self.is_sequence_parallel = is_sequence_parallel  # 是否启用序列并行
         self.sp_size = tp_size_ if is_sequence_parallel else 1
+        # 序列并行通常与TP共享同一组GPU
+        # 示例：TP=4且启用SP -> SP也在这4个GPU上工作，每GPU处理1/4序列
 
+        # ============================================================
+        # 7. 创建MoE并行配置对象
+        # ============================================================
         self.moe_parallel_config: FusedMoEParallelConfig = FusedMoEParallelConfig.make(
-            tp_size_=tp_size_,
-            pcp_size_=pcp_size_,
-            dp_size_=dp_size_,
-            vllm_parallel_config=vllm_config.parallel_config,
-        )
+            tp_size_=tp_size_,  # 传入TP大小
+            pcp_size_=pcp_size_,  # 传入PCP大小
+            dp_size_=dp_size_,  # 传入DP大小
+            vllm_parallel_config=vllm_config.parallel_config,  # 全局并行配置
+        )  # 这个对象封装了所有并行相关的配置和rank信息
 
+        # ============================================================
+        # 8. 计算专家数量
+        # ============================================================
         self.global_num_experts = num_experts + num_redundant_experts
+        # 全局物理专家数 = 逻辑专家数 + 冗余专家数
+        # 示例：64个逻辑专家 + 2个冗余专家 = 66个物理专家
+        
         self.logical_num_experts = num_experts
+        # 逻辑专家数：模型定义的专家数量（如Mixtral-8x7B中的8）
 
+        # ============================================================
+        # 9. 保存专家映射表（用于权重加载）
+        # ============================================================
         # Expert mapping used in self.load_weights
         self.expert_mapping = expert_mapping
+        # 格式：[(param_name, weight_name, expert_id, shard_id), ...]
+        # 用于将checkpoint的权重名称映射到模型参数
 
+        # ============================================================
+        # 10. 对齐hidden_size以优化性能
+        # ============================================================
         # Round up hidden size if needed.
         hidden_size = maybe_roundup_hidden_size(
-            hidden_size,
-            moe_in_dtype,
-            quant_config,
-            self.moe_parallel_config,
-            is_lora_enabled=self.vllm_config.lora_config is not None,
+            hidden_size,  # 原始hidden_size（如1024）
+            moe_in_dtype,  # 激活值类型（如fp16）
+            quant_config,  # 量化配置
+            self.moe_parallel_config,  # 并行配置
+            is_lora_enabled=self.vllm_config.lora_config is not None,  # 是否启用LoRA
         )
+        # 可能会将hidden_size向上取整到128或256的倍数
+        # 目的：优化GPU内存访问和kernel性能
+        # 示例：1024 -> 1024（已对齐），1536 -> 1664（取整到128倍数）
 
+        # ============================================================
+        # 11. 注册层到编译上下文（支持torch.compile）
+        # ============================================================
         # For smuggling this layer into the fused moe custom op
         compilation_config = vllm_config.compilation_config
-        if prefix in compilation_config.static_forward_context:
+        if prefix in compilation_config.static_forward_context:  # 检查重复
             raise ValueError("Duplicate layer name: {}".format(prefix))
-        compilation_config.static_forward_context[prefix] = self
-        self.layer_name = prefix
+        compilation_config.static_forward_context[prefix] = self  # 注册当前层
+        self.layer_name = prefix  # 保存层名称（如"model.layers.0.mlp"）
 
-        self.enable_eplb = enable_eplb
-        self.expert_load_view: torch.Tensor | None = None
-        self.logical_to_physical_map: torch.Tensor | None = None
-        self.logical_replica_count: torch.Tensor | None = None
+        # ============================================================
+        # 12. 初始化EPLB（专家并行负载均衡）相关状态
+        # ============================================================
+        self.enable_eplb = enable_eplb  # 是否启用负载均衡
+        # EPLB通过动态专家副本分配来平衡负载
+        self.expert_load_view: torch.Tensor | None = None  # 专家负载视图（记录每个专家的使用情况）
+        self.logical_to_physical_map: torch.Tensor | None = None  # 逻辑专家ID到物理专家ID的映射
+        self.logical_replica_count: torch.Tensor | None = None  # 每个逻辑专家的副本数量
+        # 这些张量会在后续的set_eplb_state中设置
+        
         self.expert_placement_strategy: ExpertPlacementStrategy = (
             vllm_config.parallel_config.expert_placement_strategy
-        )
+        )  # 专家放置策略："linear"或"round_robin"
+        # 指的是在ep场景下，如何将多个专家分配到不同GPU上
+        # linear: 线性分配，连续的专家分配给同一GPU
+        # round_robin: 轮询分配，专家交替分配给不同GPU
 
+        # ============================================================
+        # 13. 检查ROCm AITER MoE特性支持
+        # ============================================================
         # ROCm aiter shared experts fusion
+        # AITER是AMD GPU上的优化MoE实现
         self.rocm_aiter_fmoe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
+        # 检查基础AITER MoE是否可用
+        
         self.aiter_fmoe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        )
+        )  # 检查AITER是否支持共享专家融合
 
         self.num_fused_shared_experts = (
-            n_shared_experts
-            if n_shared_experts is not None and self.aiter_fmoe_shared_expert_enabled
-            else 0
+            n_shared_experts  # 如果指定了共享专家数量
+            if n_shared_experts is not None and self.aiter_fmoe_shared_expert_enabled  # 且AITER支持
+            else 0  # 否则为0
         )
+        # 共享专家：所有token都会经过的专家（如DeepSeekV2）
+        # 与路由专家不同，共享专家不需要路由选择
+        
         if (
-            not self.aiter_fmoe_shared_expert_enabled
-            and self.num_fused_shared_experts != 0
+            not self.aiter_fmoe_shared_expert_enabled  # 如果AITER不支持共享专家
+            and self.num_fused_shared_experts != 0  # 但指定了共享专家数量
         ):
             raise ValueError(
                 "n_shared_experts is only supported on ROCm aiter when "
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled"
-            )
+            )  # 抛出错误
 
+        # ============================================================
+        # 14. 确定专家映射（核心：决定哪些专家在当前GPU上）
+        # ============================================================
         # Determine expert maps
-        if self.use_ep:
-            if self.enable_eplb:
+        if self.use_ep:  # 如果使用专家并行
+            # --------------------------------------------------------
+            # 14.1 验证EPLB和冗余专家的兼容性
+            # --------------------------------------------------------
+            if self.enable_eplb:  # 如果启用专家并行负载均衡
                 assert self.global_num_experts % self.ep_size == 0, (
                     "EPLB currently only supports even distribution of "
                     "experts across ranks."
                 )
-            else:
+                # EPLB要求专家数能被EP size整除，以便均匀分配
+                # 示例：66个专家（64+2冗余），2个GPU -> 每GPU 33个专家 ✅
+                #      65个专家（64+1冗余），2个GPU -> 无法均分 ❌
+            else:  # 如果未启用EPLB
                 assert num_redundant_experts == 0, (
                     "Redundant experts are only supported with EPLB."
                 )
+                # 冗余专家只在EPLB模式下支持
+                # 因为EPLB负责管理冗余专家的动态映射
 
+            # --------------------------------------------------------
+            # 14.2 确定最终使用的专家放置策略
+            # --------------------------------------------------------
             self.expert_placement_strategy = determine_expert_placement_strategy(
-                expert_placement_strategy=self.expert_placement_strategy,
-                moe_parallel_config=self.moe_parallel_config,
-                num_expert_group=num_expert_group,
-                num_redundant_experts=num_redundant_experts,
-                enable_eplb=self.enable_eplb,
+                expert_placement_strategy=self.expert_placement_strategy,  # 用户请求的策略
+                moe_parallel_config=self.moe_parallel_config,  # 并行配置
+                num_expert_group=num_expert_group,  # 专家组数量
+                num_redundant_experts=num_redundant_experts,  # 冗余专家数
+                enable_eplb=self.enable_eplb,  # 是否启用EPLB
             )
+            # 这个函数会检查round-robin策略的所有前提条件
+            # 如果不满足则回退到linear策略
 
-            self._expert_map: torch.Tensor | None
+            # --------------------------------------------------------
+            # 14.3 计算专家映射：全局ID -> 本地ID
+            # --------------------------------------------------------
+            self._expert_map: torch.Tensor | None  # 类型标注
             local_num_experts, expert_map, expert_mask = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-                expert_placement_strategy=self.expert_placement_strategy,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                return_expert_mask=self.rocm_aiter_fmoe_enabled,
+                ep_size=self.ep_size,  # EP组大小（如4个GPU）
+                ep_rank=self.ep_rank,  # 当前rank（0-3）
+                global_num_experts=self.global_num_experts,  # 全局专家数（如64）
+                expert_placement_strategy=self.expert_placement_strategy,  # 放置策略
+                num_fused_shared_experts=self.num_fused_shared_experts,  # 共享专家数
+                return_expert_mask=self.rocm_aiter_fmoe_enabled,  # 是否需要mask（ROCm）
             )
-            self.local_num_experts = local_num_experts
-            self.register_buffer("_expert_map", expert_map)
-            self.register_buffer("expert_mask", expert_mask)
+            # 返回值：
+            # - local_num_experts: 当前GPU上的专家数（如16）
+            # - expert_map: 全局ID到本地ID的映射 [global_num_experts]
+            #   示例：[0,1,2,...,15,-1,-1,...,-1] 表示全局专家0-15在本地，其他不在
+            # - expert_mask: 用于ROCm AITER kernel的mask（可选）
+            
+            self.local_num_experts = local_num_experts  # 保存本地专家数
+            
+            # --------------------------------------------------------
+            # 14.4 注册映射tensor为buffer（不参与梯度，但会保存/加载）
+            # --------------------------------------------------------
+            self.register_buffer("_expert_map", expert_map)  # 注册为persistent buffer
+            self.register_buffer("expert_mask", expert_mask)  # 注册expert mask
+            # register_buffer的作用：
+            # 1. 这些tensor会随模型一起保存/加载
+            # 2. 会自动移动到正确的device
+            # 3. 不会被优化器更新（非参数）
+            
+            # --------------------------------------------------------
+            # 14.5 初始化专家路由表（round-robin策略需要）
+            # --------------------------------------------------------
             self._maybe_init_expert_routing_tables()
+            # 如果使用round-robin + DeepEP backend，创建额外的路由表
+            # 包括：global_to_physical, physical_to_global, local_to_global映射
+            
+            # --------------------------------------------------------
+            # 14.6 记录EP配置信息（只记录一次）
+            # --------------------------------------------------------
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
                 "placement strategy: %s. Local/global"
                 " number of experts: %s/%s. Experts local to global index map:"
                 " %s.",
-                self.ep_rank,
-                self.ep_size,
-                self.expert_placement_strategy,
-                self.local_num_experts,
-                self.global_num_experts,
-                get_compressed_expert_map(self._expert_map),
+                self.ep_rank,  # 当前rank（如0）
+                self.ep_size,  # 总EP size（如4）
+                self.expert_placement_strategy,  # 策略名（linear/round_robin）
+                self.local_num_experts,  # 本地专家数（如16）
+                self.global_num_experts,  # 全局专家数（如64）
+                get_compressed_expert_map(self._expert_map),  # 压缩的映射字符串
             )
-        else:
+            # 日志示例：
+            # [EP Rank 0/4] Expert parallelism is enabled. Expert placement strategy: linear.
+            # Local/global number of experts: 16/64. Experts local to global index map:
+            # 0->0, 1->1, 2->2, ..., 15->15.
+            
+        else:  # 如果不使用专家并行（单GPU或TP only）
+            # --------------------------------------------------------
+            # 14.7 单GPU情况：所有专家都在本地
+            # --------------------------------------------------------
             self.local_num_experts, self._expert_map, self.expert_mask = (
-                self.global_num_experts,
-                None,
-                None,
+                self.global_num_experts,  # 本地 = 全局
+                None,  # 不需要映射（所有专家都在本地）
+                None,  # 不需要mask
             )
+            # 示例：64个专家，单GPU -> local_num_experts=64, 无需映射
 
-        self.top_k = top_k
+        # ============================================================
+        # 15. 保存Top-K配置
+        # ============================================================
+        self.top_k = top_k  # 每个token选择的专家数量（如2表示Top-2）
 
+        # ============================================================
+        # 16. 初始化AITER共享专家TopK缓冲区（ROCm特定）
+        # ============================================================
         self._init_aiter_shared_experts_topK_buffer(
-            vllm_config=vllm_config, dp_size=dp_size_
+            vllm_config=vllm_config,  # vLLM配置
+            dp_size=dp_size_,  # 数据并行大小
         )
-        if self.use_ep and self.rocm_aiter_fmoe_enabled:
+        # AITER是AMD ROCm平台的优化MoE实现
+        # 这个buffer用于处理共享专家和路由专家的TopK元数据
+        # 如果num_fused_shared_experts > 0，会创建额外的缓冲区
+        
+        # --------------------------------------------------------
+        # 16.1 验证AITER expert_mask的格式
+        # --------------------------------------------------------
+        if self.use_ep and self.rocm_aiter_fmoe_enabled:  # 如果使用EP且启用AITER
             assert self.expert_mask is None or torch.all(
                 (expert_mask == 0) | (expert_mask == 1)
             ), "Aiter Fused MoE kernel only supports expert_map with 0 and 1s."
+            # AITER kernel要求expert_mask只包含0和1
+            # 0表示专家不在当前GPU，1表示在当前GPU
+            # 这是ROCm AITER实现的硬性要求
 
-        assert intermediate_size % self.tp_size == 0
-        self.hidden_size = hidden_size
+        # ============================================================
+        # 16. 设置MoE层的基本参数
+        # ============================================================
+        assert intermediate_size % self.tp_size == 0  # 确保中间层大小可以被TP整除
+        self.hidden_size = hidden_size  # 隐藏层大小（可能已向上取整）
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
-        self.reduce_results = reduce_results
-        self.renormalize = renormalize
-        self.use_grouped_topk = use_grouped_topk
+        # 每个TP分区的中间层大小
+        # 示例：intermediate_size=4096，TP=4 -> 每分区1024
+        
+        self.reduce_results = reduce_results  # 是否reduce输出（TP/EP时）
+        self.renormalize = renormalize  # 是否重新归一化TopK权重
+        
+        # ============================================================
+        # 17. 配置分组TopK（DeepSeek等模型使用）
+        # ============================================================
+        self.use_grouped_topk = use_grouped_topk  # 是否使用分组TopK
+        # 分组TopK：先将专家分成若干组，每组内选Top-K，然后跨组再选
+        # 示例：64专家分8组，每组8专家，每组选Top-2，最后从8组中选Top-4
         if self.use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.custom_routing_function = custom_routing_function
-        self.scoring_func = scoring_func
-        self.routed_scaling_factor = routed_scaling_factor
-        self.e_score_correction_bias = e_score_correction_bias
+            # 分组TopK必须指定组数和每组的K
+        self.num_expert_group = num_expert_group  # 专家组数量
+        self.topk_group = topk_group  # 每组选择的专家数
+        
+        # ============================================================
+        # 18. 配置路由相关参数
+        # ============================================================
+        self.custom_routing_function = custom_routing_function  # 自定义路由函数（可选）
+        self.scoring_func = scoring_func  # 评分函数："softmax"或"sigmoid"
+        # - softmax: 归一化后选TopK（传统方法）
+        # - sigmoid: 独立评分后选TopK（DeepSeekV3/Llama4）
+        
+        self.routed_scaling_factor = routed_scaling_factor  # 路由权重缩放因子
+        # 某些模型会缩放专家输出权重，如0.5倍
+        
+        self.e_score_correction_bias = e_score_correction_bias  # 专家分数修正偏置
+        # DeepSeek等模型使用，用于校正专家偏好
+        
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.activation = activation
+        # 是否在输入上应用路由权重（不常用）
+        
+        self.activation = activation  # 激活函数类型（如"silu"）
 
+        # ============================================================
+        # 19. 验证scoring_func与topk模式的兼容性
+        # ============================================================
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
+            # 非softmax的评分函数（如sigmoid）只支持分组TopK
             raise ValueError(
                 "Only softmax scoring function is supported for non-grouped topk."
             )
 
+        # ============================================================
+        # 20. 确定路由方法类型（影响kernel选择）
+        # ============================================================
         # ToDo: Better logic to determine the routing method type
-        if routing_method_type is not None:
+        if routing_method_type is not None:  # 如果显式指定了
             self.routing_method_type = routing_method_type
-        else:
-            if scoring_func == "sigmoid":
-                if self.use_grouped_topk:
+        else:  # 否则根据其他参数自动推断
+            if scoring_func == "sigmoid":  # Sigmoid评分
+                if self.use_grouped_topk:  # 分组TopK
                     self.routing_method_type = RoutingMethodType.DeepSeekV3
-                elif self.top_k == 1:
+                    # DeepSeekV3路由：Sigmoid + 分组TopK
+                elif self.top_k == 1:  # Top-1选择
                     self.routing_method_type = RoutingMethodType.Llama4
-            elif self.scoring_func == "softmax":
+                    # Llama4路由：Sigmoid + Top-1
+            elif self.scoring_func == "softmax":  # Softmax评分（最常见）
                 self.routing_method_type = (
-                    RoutingMethodType.Renormalize
+                    RoutingMethodType.Renormalize  # Softmax后再做TopK再归一化
                     if not self.renormalize
-                    else RoutingMethodType.RenormalizeNaive
+                    else RoutingMethodType.RenormalizeNaive  # 简单的Softmax+TopK
                 )
-            else:
-                self.routing_method_type = RoutingMethodType.TopK
+            else:  # 其他情况
+                self.routing_method_type = RoutingMethodType.TopK  # 基础TopK
 
+        # ============================================================
+        # 21. 创建MoE层配置对象
+        # ============================================================
         self.moe_config: FusedMoEConfig = FusedMoEConfig(
-            num_experts=self.global_num_experts,
-            experts_per_token=top_k,
-            hidden_dim=hidden_size,
-            num_local_experts=self.local_num_experts,
-            moe_parallel_config=self.moe_parallel_config,
-            in_dtype=moe_in_dtype,
-            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
-            has_bias=has_bias,
-            is_act_and_mul=is_act_and_mul,
-            is_lora_enabled=vllm_config.lora_config is not None,
+            num_experts=self.global_num_experts,  # 全局专家数（含冗余）
+            experts_per_token=top_k,  # 每个token选择的专家数
+            hidden_dim=hidden_size,  # 隐藏层维度
+            num_local_experts=self.local_num_experts,  # 本地专家数（EP后）
+            moe_parallel_config=self.moe_parallel_config,  # 并行配置
+            in_dtype=moe_in_dtype,  # 输入激活值类型（fp16/bf16）
+            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,  # DP分块的最大token数
+            has_bias=has_bias,  # 专家MLP是否有bias
+            is_act_and_mul=is_act_and_mul,  # 是否使用SiluAndMul融合
+            is_lora_enabled=vllm_config.lora_config is not None,  # 是否启用LoRA
         )
+        # 这个配置对象会传递给各种MoE kernel
+        
         self.moe_config_use_flashinfer_cutlass_kernels = (
             self.moe_config.use_flashinfer_cutlass_kernels
-        )
+        )  # 缓存是否使用FlashInfer CUTLASS kernels
 
-        self.quant_config = quant_config
+        # ============================================================
+        # 22. 设置量化配置
+        # ============================================================
+        self.quant_config = quant_config  # 保存量化配置对象（如FP8Config）
 
         def _get_quant_method() -> FusedMoEMethodBase:
             """
-            Helper method to ensure self.quant_method is never None and
-            of the proper type.
+            获取量化方法对象的辅助函数。
+            
+            确保self.quant_method永远不为None且类型正确。
+            
+            选择逻辑：
+            1. 如果有quant_config，从config获取对应的quant_method
+            2. 否则使用UnquantizedFusedMoEMethod（标准fp16/bf16）
+            
+            Returns:
+                FusedMoEMethodBase: 量化方法对象
             """
             quant_method = None
-            if self.quant_config is not None:
+            if self.quant_config is not None:  # 如果指定了量化
+                # 从量化配置获取对应的方法（如Fp8MoEMethod）
                 quant_method = self.quant_config.get_quant_method(self, prefix)
-            if quant_method is None:
+            if quant_method is None:  # 如果没有量化或获取失败
+                # 使用未量化方法（标准计算）
                 quant_method = UnquantizedFusedMoEMethod(self.moe_config)
-            assert isinstance(quant_method, FusedMoEMethodBase)
+            assert isinstance(quant_method, FusedMoEMethodBase)  # 类型检查
             return quant_method
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
+        # 注意：get_quant_method会查看local_num_experts来做启发式选择，
+        # 所以必须先初始化local_num_experts
         self.quant_method: FusedMoEMethodBase = _get_quant_method()
+        # 保存量化方法对象，后续forward时会调用其apply方法
 
+        # ============================================================
+        # 23. 验证激活-乘法模式的兼容性
+        # ============================================================
         if not self.moe_config.is_act_and_mul:
+            # is_act_and_mul=False: 不使用SiluAndMul融合（较罕见）
+            # 只有特定量化方法支持这种模式
+            
             # Avoid circular import
             from vllm.model_executor.layers.quantization.modelopt import (
                 ModelOptFp8MoEMethod,
@@ -597,21 +953,25 @@ class FusedMoE(CustomOp):
             if not isinstance(
                 self.quant_method,
                 (
-                    UnquantizedFusedMoEMethod,
-                    ModelOptFp8MoEMethod,
-                    ModelOptNvFp4FusedMoE,
+                    UnquantizedFusedMoEMethod,  # 未量化
+                    ModelOptFp8MoEMethod,  # ModelOpt FP8
+                    ModelOptNvFp4FusedMoE,  # ModelOpt NvFp4
                 ),
             ):
                 raise NotImplementedError(
                     "is_act_and_mul=False is supported only for unquantized "
                     ", ModelOpt FP8, and ModelOpt NvFp4 checkpoints"
                 )
-            if not current_platform.is_cuda():
+            if not current_platform.is_cuda():  # 且只支持CUDA
                 raise NotImplementedError(
                     "is_act_and_mul=False is supported only for CUDA for now"
                 )
 
+        # ============================================================
+        # 24. 验证EPLB与量化方法的兼容性
+        # ============================================================
         if self.enable_eplb and not self.quant_method.supports_eplb:
+            # EPLB目前只支持部分量化方法
             # TODO: Add support for additional quantization methods.
             # The implementation for other quantization methods does not
             # contain essential differences, but the current quant API
@@ -624,27 +984,40 @@ class FusedMoE(CustomOp):
                 "EPLB is only supported for FP8 quantization for now."
             )
 
+        # ============================================================
+        # 25. 创建专家权重
+        # ============================================================
+        # 准备传递给create_weights的参数
         moe_quant_params = {
-            "num_experts": self.local_num_experts,
-            "hidden_size": hidden_size,
-            "intermediate_size_per_partition": self.intermediate_size_per_partition,
-            "params_dtype": params_dtype,
-            "weight_loader": self.weight_loader,
-            "global_num_experts": self.global_num_experts,
+            "num_experts": self.local_num_experts,  # 本地专家数
+            "hidden_size": hidden_size,  # 隐藏层大小
+            "intermediate_size_per_partition": self.intermediate_size_per_partition,  # 每分区中间层大小
+            "params_dtype": params_dtype,  # 参数类型
+            "weight_loader": self.weight_loader,  # 权重加载函数
+            "global_num_experts": self.global_num_experts,  # 全局专家数
         }
         # need full intermediate size pre-sharding for WNA16 act order
+        # WNA16（Weight-only INT4/8 Activation FP16）量化需要完整的中间层大小
         if self.quant_method.__class__.__name__ in (
-            "GPTQMarlinMoEMethod",
-            "CompressedTensorsWNA16MarlinMoEMethod",
-            "CompressedTensorsWNA16MoEMethod",
+            "GPTQMarlinMoEMethod",  # GPTQ Marlin量化
+            "CompressedTensorsWNA16MarlinMoEMethod",  # CompressedTensors WNA16 Marlin
+            "CompressedTensorsWNA16MoEMethod",  # CompressedTensors WNA16
         ):
             moe_quant_params["intermediate_size_full"] = intermediate_size
+            # 传入完整大小（TP切分前）用于正确的act order处理
 
+        # 调用量化方法的create_weights创建权重张量
+        # 这会注册w13_weight, w2_weight等参数到模块
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
+        # ============================================================
+        # 26. 初始化DP分块的staging tensors
+        # ============================================================
         # Chunked all2all staging tensor
-        self.batched_hidden_states: torch.Tensor | None = None
-        self.batched_router_logits: torch.Tensor | None = None
+        # 用于数据并行分块计算时的临时缓冲区
+        self.batched_hidden_states: torch.Tensor | None = None  # 批处理的隐藏状态缓冲
+        self.batched_router_logits: torch.Tensor | None = None  # 批处理的路由logits缓冲
+        # 这些会在第一次forward时根据需要创建
 
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
@@ -1100,13 +1473,45 @@ class FusedMoE(CustomOp):
 
     def weight_loader(
         self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
+        param: torch.nn.Parameter,  # 目标参数（如self.w13_weight）
+        loaded_weight: torch.Tensor,  # 从checkpoint加载的权重
+        weight_name: str,  # 权重的完整名称（如"model.layers.0.mlp.experts.0.gate_proj.weight"）
+        shard_id: str,  # 分片ID："w1"(gate)/"w2"(down)/"w3"(up)
+        expert_id: int,  # 全局专家ID（0到global_num_experts-1）
+        return_success: bool = False,  # 是否返回加载成功标志
     ) -> bool | None:
+        """
+        MoE专家权重加载器 - 将checkpoint中的权重加载到模型参数中。
+        
+        这个方法处理各种复杂情况：
+        1. 专家并行(EP)：只加载分配给当前rank的专家
+        2. 张量并行(TP)：对权重进行切分
+        3. 量化：处理量化权重和缩放因子
+        4. 权重合并：w1和w3合并为w13
+        
+        Args:
+            param: 目标参数张量（如w13_weight [num_experts, 2*intermediate, hidden]）
+            loaded_weight: 从checkpoint加载的单个专家权重
+            weight_name: 权重的完整限定名称
+            shard_id: 标识是哪个权重："w1"/"w2"/"w3"
+            expert_id: 全局专家索引
+            return_success: 是否返回bool标志
+        
+        Returns:
+            bool | None: 如果return_success=True，返回加载是否成功；否则返回None
+        
+        示例：
+            # 加载Mixtral-8x7B的第2个专家的gate_proj权重
+            weight_name = "model.layers.0.mlp.experts.2.gate_proj.weight"
+            shard_id = "w1"  # gate_proj对应w1
+            expert_id = 2
+            loaded_weight shape: [intermediate_size, hidden_size]
+            
+            # EP=2，当前rank=0，专家0-3在rank0，专家4-7在rank1
+            if expert_id < 4:  # 专家2在当前rank
+                # 映射到本地索引2
+                # 加载到param.data[2][0:intermediate_size, :]（w13的前半部分）
+        """
         if self.quant_config and self.quant_config.get_name() == "mxfp4":
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
@@ -1514,21 +1919,65 @@ class FusedMoE(CustomOp):
 
     def select_experts(
         self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        hidden_states: torch.Tensor,  # 输入隐藏状态 [num_tokens, hidden_size]
+        router_logits: torch.Tensor,  # 路由器输出的logits [num_tokens, num_experts]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Route the input hidden states to the top-k experts based on the
-        router logits.
+        根据路由器logits将输入隐藏状态路由到Top-K专家。
+        
+        这是MoE的核心路由逻辑，决定每个token使用哪些专家。
+        
+        主要流程：
+        1. 计算专家分数（softmax/sigmoid）
+        2. 选择Top-K专家
+        3. （可选）应用EPLB负载均衡
+        4. 返回专家权重和ID
+        
+        支持的路由策略：
+        - 标准TopK：Softmax -> TopK -> 重归一化
+        - 分组TopK：先组内TopK，再跨组TopK（DeepSeekV2/V3）
+        - Sigmoid路由：Sigmoid -> TopK（Llama4）
+        - 自定义路由：通过custom_routing_function
+        
+        Args:
+            hidden_states: 输入隐藏状态张量
+                shape: [num_tokens, hidden_size]
+            router_logits: 路由器输出的原始logits
+                shape: [num_tokens, num_experts]
+                每个token对每个专家的原始分数
 
         Returns:
-                (topk_weights, topk_ids)
-                (tuple[torch.Tensor, torch.Tensor]):
-                The weights and expert ids.
-
-            **Compatibility**: When EPLB is not enabled, the returned ids are
-            equivalent to global logical ids, so should be compatible with
-            plain MoE implementations without redundant experts.
+            tuple[torch.Tensor, torch.Tensor]: (topk_weights, topk_ids)
+                - topk_weights: Top-K专家的归一化权重
+                    shape: [num_tokens, top_k]
+                    示例：Top-2时可能是[[0.6, 0.4], [0.7, 0.3], ...]
+                - topk_ids: 选中的专家ID
+                    shape: [num_tokens, top_k]
+                    示例：Top-2时可能是[[2, 5], [1, 7], ...]
+                    
+            **兼容性说明**: 
+            - 当EPLB未启用时，返回的ID是全局逻辑ID，与普通MoE实现兼容
+            - 当EPLB启用时，返回的ID是物理ID（可能包含冗余专家）
+        
+        示例1 - 标准TopK（Softmax）：
+            router_logits = [[1.0, 2.0, 0.5, 1.5], ...]  # 4个专家
+            top_k = 2
+            
+            # 计算softmax
+            scores = softmax([[1.0, 2.0, 0.5, 1.5]]) = [[0.15, 0.41, 0.09, 0.27]]
+            
+            # 选择Top-2
+            topk_ids = [[1, 3]]  # 专家1和3分数最高
+            
+            # 重归一化（只对选中的专家）
+            topk_weights = [[0.41, 0.27]] / (0.41+0.27) = [[0.60, 0.40]]
+            
+        示例2 - 分组TopK（DeepSeekV2）：
+            num_experts = 64, num_expert_group = 8, topk_group = 2, top_k = 4
+            
+            # 第1步：将64个专家分成8组，每组8个专家
+            # 第2步：每组内选Top-2 -> 得到8组 x 2专家 = 16个候选
+            # 第3步：从16个候选中选Top-4 -> 最终4个专家
         """
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_topk,
@@ -1846,118 +2295,242 @@ class FusedMoE(CustomOp):
 
     def forward_impl(
         self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        hidden_states: torch.Tensor,  # 输入隐藏状态 [num_tokens, hidden_size]
+        router_logits: torch.Tensor,  # 路由器logits [num_tokens, num_experts]
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        assert self.quant_method is not None
+        """
+        MoE层的前向传播实现 - 核心计算逻辑。
+        
+        完整流程：
+        1. 初始化量化配置和DP分块缓冲区
+        2. 设置共享专家的并行stream（如果有）
+        3. （可选）应用路由器
+        4. 选择Top-K专家（通过select_experts）
+        5. 执行专家计算（路由专家 + 共享专家）
+        6. 聚合结果
+        7. （可选）执行all2all通信（DP/EP）
+        
+        支持的模式：
+        - 标准模式：路由专家 only
+        - 共享专家模式：路由专家 + 共享专家（DeepSeekV2）
+        - DP分块模式：大batch时分chunk计算
+        - 独立stream模式：共享专家与路由专家并行计算
+        
+        Args:
+            hidden_states: 输入张量 [num_tokens, hidden_size]
+            router_logits: 路由器输出 [num_tokens, num_experts]
+        
+        Returns:
+            torch.Tensor 或 tuple[torch.Tensor, torch.Tensor]:
+                - 如果只有路由专家：返回 [num_tokens, hidden_size]
+                - 如果有共享专家：返回 (shared_output, routed_output)
+                    两个张量都是 [num_tokens, hidden_size]
+        
+        示例：
+            # Mixtral-8x7B：只有路由专家
+            hidden_states: [1024, 4096]  # 1024个token
+            router_logits: [1024, 8]     # 8个专家
+            output: [1024, 4096]          # 聚合后的输出
+            
+            # DeepSeekV2：路由专家 + 共享专家
+            hidden_states: [1024, 4096]
+            router_logits: [1024, 64]    # 64个路由专家
+            output: ([1024, 4096], [1024, 4096])  # (共享输出, 路由输出)
+        """
+        assert self.quant_method is not None  # 确保量化方法已初始化
 
-        self.ensure_moe_quant_config_init()
-        self.ensure_dp_chunking_init()
+        # ============================================================
+        # 1. 初始化量化配置和DP分块
+        # ============================================================
+        self.ensure_moe_quant_config_init()  # 确保量化配置已初始化（延迟初始化）
+        self.ensure_dp_chunking_init()  # 确保DP分块缓冲区已创建
 
+        # ============================================================
+        # 2. 检查是否有独立的共享专家
+        # ============================================================
         has_separate_shared_experts = (
-            not isinstance(self.quant_method, FusedMoEModularMethod)
-            and self.shared_experts is not None
+            not isinstance(self.quant_method, FusedMoEModularMethod)  # 不是模块化方法
+            and self.shared_experts is not None  # 且有共享专家
         )
+        # 共享专家：所有token都会经过（如DeepSeekV2）
+        # 如果是FusedMoEModularMethod，共享专家已融合到主kernel中
 
-        use_chunked_impl = self.use_dp_chunking
+        use_chunked_impl = self.use_dp_chunking  # 是否使用分块实现（大batch时）
 
+        # ============================================================
+        # 3. 设置共享专家的独立CUDA stream
+        # ============================================================
         use_shared_experts_stream, hidden_states_clone = (
             self._maybe_setup_shared_experts_stream(
                 hidden_states, has_separate_shared_experts, use_chunked_impl
             )
         )
+        # 如果启用，共享专家会在独立stream上并行计算
+        # hidden_states_clone: 为共享专家准备的输入副本（避免race condition）
 
+        # ============================================================
+        # 4. （可选）应用内部路由器
+        # ============================================================
         # If router/gate provided, then apply it here.
         # (Note: This code runs only when "overlapped mode" is on to allow
         #        parallel execution of shared experts with the FusedMoE via
         #        separate cuda stream)
-        if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
+        if self.gate is not None:  # 如果MoE层有内部gate（不常见）
+            router_logits, _ = self.gate(hidden_states)  # 计算路由logits
+            # 大多数模型的gate在MoE层外部，所以self.gate通常为None
 
+        # ============================================================
+        # 4. （可选）使用分块实现（大batch场景）
+        # ============================================================
         if use_chunked_impl:
+            # 如果batch太大，使用分块处理避免OOM
+            # 适用场景：DP + PPLX/DeepEP-LL/FlashInfer-CUTLASS
             return self.forward_impl_chunked(
                 hidden_states, router_logits, has_separate_shared_experts
             )
 
+        # ============================================================
+        # 5. 判断是否需要 naive dispatch/combine（DP场景）
+        # ============================================================
+        # naive dispatch/combine: 简单的DP all-to-all + combine
+        # 条件：DP size > 1 且不使用ModularMethod（ModularMethod有更优化的实现）
         do_naive_dispatch_combine: bool = self.dp_size > 1 and not isinstance(
             self.quant_method, FusedMoEModularMethod
         )
 
-        ctx = get_forward_context()
+        # ============================================================
+        # 6. 获取序列并行上下文
+        # ============================================================
+        ctx = get_forward_context()  # 获取当前forward的全局上下文
         sp_ctx = (
+            # 如果有DP metadata，设置序列并行的local sizes
+            # 用于在SP场景下正确切分序列
             ctx.dp_metadata.sp_local_sizes(self.sp_size)
             if ctx.dp_metadata
-            else nullcontext()
+            else nullcontext()  # 否则使用空上下文（无操作）
         )
 
+        # ============================================================
+        # 7. 在序列并行上下文中执行 DP dispatch
+        # ============================================================
         with sp_ctx:
-            extra_tensors = None
+            extra_tensors = None  # 额外的tensor（用于某些量化方法）
+            
             if do_naive_dispatch_combine:
+                # --------------------------------------------------------
+                # 7.1 检查是否使用 post-quantization all-gather
+                # --------------------------------------------------------
                 # Avoid circular import
                 from vllm.model_executor.layers.quantization.modelopt import (
                     ModelOptNvFp4FusedMoE,
                 )
 
+                # post_quant_allgather: 在量化后执行all-gather
+                # 适用于 FlashInfer + ModelOpt NvFp4 + DP + EP 的组合
+                # 优势：减少通信量（传输量化后的数据）
                 post_quant_allgather = (
-                    has_flashinfer_trtllm_fused_moe()
-                    and self.quant_method is not None
-                    and self.dp_size > 1
-                    and self.use_ep
-                    and isinstance(self.quant_method, ModelOptNvFp4FusedMoE)
+                    has_flashinfer_trtllm_fused_moe()  # 有FlashInfer TRT-LLM kernel
+                    and self.quant_method is not None  # 有量化方法
+                    and self.dp_size > 1  # 使用数据并行
+                    and self.use_ep  # 使用专家并行
+                    and isinstance(self.quant_method, ModelOptNvFp4FusedMoE)  # 是NvFp4量化
                 )
+                
+                # --------------------------------------------------------
+                # 7.2 准备dispatch的数据
+                # --------------------------------------------------------
                 if post_quant_allgather:
+                    # 如果使用post-quant all-gather，需要准备额外的量化tensor
+                    # extra_tensors: 量化相关的辅助数据（如scale、zero_point）
                     hidden_states_to_dispatch, extra_tensors = (
                         self.quant_method.prepare_dp_allgather_tensor(
                             self, hidden_states, router_logits
                         )
                     )
                 else:
+                    # 标准情况：直接dispatch原始hidden_states
                     hidden_states_to_dispatch = hidden_states
 
+                # --------------------------------------------------------
+                # 7.3 执行 EP dispatch（all-to-all通信）
+                # --------------------------------------------------------
+                # EP dispatch: 根据router logits将token分发到对应的专家所在GPU
+                # 输入: [num_tokens, hidden_size] per GPU
+                # 输出: [num_tokens_after_dispatch, hidden_size] per GPU
+                #       (每个GPU接收需要本地专家处理的tokens)
                 dispatch_res = get_ep_group().dispatch(
-                    hidden_states_to_dispatch,
-                    router_logits,
-                    self.is_sequence_parallel,
-                    extra_tensors=extra_tensors,
+                    hidden_states_to_dispatch,  # 要分发的hidden states
+                    router_logits,  # 路由器输出（决定token去哪个GPU）
+                    self.is_sequence_parallel,  # 是否使用序列并行
+                    extra_tensors=extra_tensors,  # 额外的量化tensor
                 )
+                
+                # --------------------------------------------------------
+                # 7.4 处理 dispatch 结果
+                # --------------------------------------------------------
                 if extra_tensors is not None:
+                    # 如果有extra_tensors，dispatch返回3个值
                     hidden_states_combined, router_logits, extra_tensors_combined = (
                         dispatch_res
                     )
+                    # 将hidden_states和extra_tensors组合成元组
+                    # 后续量化kernel需要这两个tensor一起使用
                     hidden_states_combined = (
                         hidden_states_combined,
-                        extra_tensors_combined[0],
+                        extra_tensors_combined[0],  # 通常是量化的scale或其他元数据
                     )
                 else:
+                    # 标准情况：只有hidden_states和router_logits
                     hidden_states_combined, router_logits = dispatch_res
 
+            # ============================================================
+            # 7. （可选）先计算共享专家
+            # ============================================================
             # Run shared experts before matrix multiply.
             # because matrix multiply maybe modify the hidden_states.
             if has_separate_shared_experts and not use_shared_experts_stream:
+                # 如果有共享专家且不使用独立stream
+                # 在主stream上先计算共享专家
                 assert self.shared_experts is not None
                 shared_output = self.shared_experts(hidden_states)
+                # shared_output: [num_tokens, hidden_size]
 
+            # ============================================================
+            # 8. （可选）PCP all-gather
+            # ============================================================
             # NOTE: Similar with DP, PCP also needs dispatch and combine. For
             # simplicity, AgRsAll2All was added separately for PCP here. Maybe
             # we should modify All2AllManager abstract to better support PCP.
-            if self.pcp_size > 1:
+            if self.pcp_size > 1:  # 如果使用部分上下文并行
+                # 将分散在各GPU上的序列片段聚合到一起
                 hidden_states = get_pcp_group().all_gather(
-                    hidden_states,
-                    dim=0,
-                )
+                    hidden_states,  # [num_tokens/pcp_size, hidden_size]
+                    dim=0,  # 在token维度聚合
+                )  # 输出: [num_tokens, hidden_size]
+                
                 router_logits = get_pcp_group().all_gather(
-                    router_logits,
+                    router_logits,  # [num_tokens/pcp_size, num_experts]
                     dim=0,
-                )
+                )  # 输出: [num_tokens, num_experts]
+                # 聚合后每个GPU都有完整的序列
 
+            # ============================================================
+            # 9. 执行专家计算（核心）
+            # ============================================================
             # Matrix multiply.
+            # 调用量化方法的apply执行实际的MoE计算
             final_hidden_states = self.quant_method.apply(
-                layer=self,
-                x=hidden_states_combined
+                layer=self,  # 当前MoE层
+                x=hidden_states_combined  # 如果有DP dispatch则用combined
                 if do_naive_dispatch_combine
-                else hidden_states,
-                router_logits=router_logits,
+                else hidden_states,  # 否则用原始hidden_states
+                router_logits=router_logits,  # 路由logits
             )
+            # 这个apply方法内部会：
+            # 1. 调用select_experts选择Top-K专家
+            # 2. 执行专家MLP计算（w13 -> activation -> w2）
+            # 3. 加权聚合各专家输出
+            # 输出: [num_tokens, hidden_size]
 
             if has_separate_shared_experts:
                 assert self.shared_experts is not None
@@ -2092,9 +2665,10 @@ def moe_forward_shared(
     router_logits: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # 从forward context中获取FusedMoE层实例
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    assert self.shared_experts is not None
+    assert self.shared_experts is not None  # 所有的moe模型一定有共享专家吗？
     return self.forward_impl(hidden_states, router_logits)
 
 

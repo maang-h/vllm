@@ -128,10 +128,10 @@ class Qwen2Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = num_heads
+        self.total_num_heads = num_heads   # Q head 总数
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
+        self.num_heads = self.total_num_heads // tp_size  # 当前GPU的Q head
+        self.total_num_kv_heads = num_kv_heads  # K/V head
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -140,15 +140,15 @@ class Qwen2Attention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)  # 当前GPU上的K/V head
+        self.head_dim = hidden_size // self.total_num_heads  # 每个头的维度
+        self.q_size = self.num_heads * self.head_dim  # 当前GPU上的q的总维度
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.dual_chunk_attention_config = dual_chunk_attention_config
         self.qk_norm = qk_norm
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = QKVParallelLinear(  # 用于hidden state到Q、K、V的投影
             hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -157,7 +157,7 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = RowParallelLinear(  # 将多头拼接为一头
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -170,7 +170,7 @@ class Qwen2Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope(  # 给Q和K注入位置信息
             self.head_dim,
             max_position=max_position,
             rope_parameters=rope_parameters,
@@ -181,7 +181,7 @@ class Qwen2Attention(nn.Module):
             if attn_type == AttentionType.ENCODER_ONLY
             else Attention
         )
-        self.attn = attn_cls(
+        self.attn = attn_cls(  # Attention 计算
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -203,8 +203,8 @@ class Qwen2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        qkv, _ = self.qkv_proj(hidden_states)  # 投影计算
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)  # 拆分为多头
 
         # Apply QK normalization if enabled (before RoPE)
         if self.qk_norm:
@@ -222,9 +222,9 @@ class Qwen2Attention(nn.Module):
             q = q.view(total_tokens, self.q_size)
             k = k.view(total_tokens, self.kv_size)
 
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        q, k = self.rotary_emb(positions, q, k)  # 注入位置信息  ？只给q、k注入？
+        attn_output = self.attn(q, k, v)  # 计算attention
+        output, _ = self.o_proj(attn_output)  # 拼接成原来的形状
         return output
 
 
@@ -237,7 +237,7 @@ class Qwen2DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.hidden_size  # 隐藏层的size
         set_default_rope_theta(config, default_theta=1000000)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
@@ -255,7 +255,7 @@ class Qwen2DecoderLayer(nn.Module):
         # Check if QK normalization is enabled (used in BAGEL and some other models)
         qk_norm = getattr(config, "qk_norm", False)
 
-        self.self_attn = Qwen2Attention(
+        self.self_attn = Qwen2Attention(  # attention层
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -269,15 +269,15 @@ class Qwen2DecoderLayer(nn.Module):
             qk_norm=qk_norm,
             rms_norm_eps=config.rms_norm_eps,
         )
-        self.mlp = Qwen2MLP(
+        self.mlp = Qwen2MLP(  # mlp层，升维、非线性激活、融合、降维
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # 输入attention前，归一化层
+        self.post_attention_layernorm = RMSNorm(  # attention之后，mlp之前，归一化
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -380,7 +380,7 @@ class Qwen2Model(nn.Module):
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
-            self.embed_tokens = VocabParallelEmbedding(
+            self.embed_tokens = VocabParallelEmbedding(  # Embedding 层
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
@@ -406,10 +406,11 @@ class Qwen2Model(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # 最终归一化层
         else:
             self.norm = PPMissingLayer()
 
+        # 在多模态中有可能需要输出一些中间结果
         self.aux_hidden_state_layers = tuple[int, ...]()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -426,7 +427,7 @@ class Qwen2Model(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)  # 做embedding
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -439,14 +440,14 @@ class Qwen2Model(nn.Module):
         ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual)  # 依序进行每一层的计算
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)  # 层归一化
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

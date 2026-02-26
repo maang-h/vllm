@@ -95,7 +95,17 @@ def split_tensor_along_last_dim(
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> tuple[int, int]:
-    """Try to evenly distribute layers across partitions.
+    """
+    在流水线并行（Pipeline Parallelism, PP）模式下，决定当前GPU进程（Rank）应该负责处理模型中的哪几层 Transformer 层的索引范围。
+
+    简单来说，如果你有 32 层模型和 4 块 GPU，这个函数会告诉第 0 块 GPU 处理第 0-7 层，第 1 块处理第 8-15 层，以此类推。
+    但它不仅仅是简单的平均分配，内部包含了一些负载均衡的优化逻辑。
+
+    num_hidden_layers: 模型总层数（如 32）。
+    pp_rank: 当前进程在流水线中的序号（0 到 pp_size - 1）。
+    pp_size: 流水线并行的总段数（即分成了几份）。
+
+    Try to evenly distribute layers across partitions.
 
     If the number of layers is not divisible by the number of partitions,
     the remaining layers are evenly distributed across all but the last
@@ -116,7 +126,7 @@ def get_pp_indices(
             raise ValueError(
                 "Invalid partition string: {}".format(partition_list_str)
             ) from err
-        if len(partitions) != pp_size:
+        if len(partitions) != pp_size: # TODO 这里的Raise信息提示不明显
             raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
         if sum(partitions) != num_hidden_layers:
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
@@ -137,7 +147,7 @@ def get_pp_indices(
     start_layer = sum(partitions[:pp_rank])
     end_layer = start_layer + partitions[pp_rank]
 
-    return (start_layer, end_layer)
+    return start_layer, end_layer   # TODO: PEP8
 
 
 @dataclasses.dataclass

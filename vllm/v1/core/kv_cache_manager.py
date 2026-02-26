@@ -221,6 +221,7 @@ class KVCacheManager:
             num_new_tokens: The number of new tokens to be allocated and computed.
             num_new_computed_tokens: The number of new computed tokens just
                 hitting the prefix caching, excluding external tokens.
+                需要计算的token中命中prefix cache的数量
             new_computed_blocks: The cached blocks for the above new computed
                 tokens, grouped as a tuple by kv cache groups.
             num_lookahead_tokens: The number of speculative tokens to allocate.

@@ -67,7 +67,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 def adjust_bitblas_shard(param, shard_size, shard_offset):
     bitblas_tile_size = getattr(param, "bitblas_tile_size", None)
     if bitblas_tile_size is not None:
-        return (shard_size // bitblas_tile_size, shard_offset // bitblas_tile_size)
+        return (shard_size // bitblas_tile_size, shard_offset // bitblas_tile_size)  # TODO(@me) 元组返回不需要单独加括号
 
     return shard_size, shard_offset
 
@@ -489,7 +489,7 @@ class ColumnParallelLinear(LinearBase):
         self._maybe_allow_fp8_block_shape_mismatch()
         self.gather_output = gather_output
 
-        if output_sizes is None:
+        if output_sizes is None:  # TODO  it can remove?
             output_sizes = [output_size]
 
         assert self.quant_method is not None
@@ -1339,8 +1339,8 @@ class RowParallelLinear(LinearBase):
         disable_tp: bool = False,
     ):
         # Divide the weight matrix along the first dimension.
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0  # TODO(@me): 这里的赋值与父类中赋值重复了
+        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1  # TODO(@me): 这里的赋值与父类中赋值重复了
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1453,7 +1453,7 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)  # [1, 32, 4, 32]
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
