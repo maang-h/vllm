@@ -41,6 +41,7 @@ MTPModelTypes = Literal[
 EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
 SpeculativeMethod = Literal[
     "ngram",
+    "customize",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -109,6 +110,15 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+
+    # Customize proposer configuration
+    customize_rule_file: str | None = None
+    """Path to a JSON file containing customize speculative decoding rules.
+
+    The file should contain a JSON list, e.g.:
+      [{"prefix": [11, 12], "fill": [657, 34, 5904]}]
+    where `prefix` matches the suffix of current tokens and `-1` is a wildcard.
+    """
 
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.

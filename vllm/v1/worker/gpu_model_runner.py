@@ -146,6 +146,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.customize import CustomizeProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -382,10 +383,12 @@ class GPUModelRunner(
         # layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
-                NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
+                NgramProposer | CustomizeProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "customize":
+                self.drafter = CustomizeProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
@@ -3240,16 +3243,16 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
         #
-        updated_tokens = []
-        for i, req_id in enumerate(scheduler_output.num_scheduled_tokens.keys()):
-            cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[i][0]
-            updated_tokens.append(self.customize_speculative(cur_token_id, req_id))
-            if cur_token_id == 151645:
-                del self.customize_output_token_ids[req_id]
-                logger.info("请求 %s 结束了", req_id)
-        sampler_output.sampled_token_ids = torch.tensor(
-            updated_tokens, device="cuda:0", dtype=torch.int32
-        )
+        # updated_tokens = []
+        # for i, req_id in enumerate(scheduler_output.num_scheduled_tokens.keys()):
+        #     cur_token_id = sampler_output.sampled_token_ids.cpu().tolist()[i][0]
+        #     updated_tokens.append(self.customize_speculative(cur_token_id, req_id))
+        #     if cur_token_id == 151645:
+        #         del self.customize_output_token_ids[req_id]
+        #         logger.info("请求 %s 结束了", req_id)
+        # sampler_output.sampled_token_ids = torch.tensor(
+        #     updated_tokens, device="cuda:0", dtype=torch.int32
+        # )
 
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3477,6 +3480,15 @@ class GPUModelRunner(
         if spec_config.method == "ngram":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
+            draft_token_ids = self.drafter.propose(
+                sampled_token_ids,
+                self.input_batch.req_ids,
+                self.input_batch.num_tokens_no_spec,
+                self.input_batch.token_ids_cpu,
+                self.input_batch.spec_decode_unsupported_reqs,
+            )
+        elif spec_config.method == "customize":
+            print("使用自定义投机解码！！！")
             draft_token_ids = self.drafter.propose(
                 sampled_token_ids,
                 self.input_batch.req_ids,
