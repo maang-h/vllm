@@ -138,6 +138,9 @@ class CustomizeProposer:
 
         return draft_token_ids
 
+    def load_model(self, *args, **kwargs):
+        # No model to load.
+        pass
 
 def batch_propose_python(
     valid_requests: list[int],
