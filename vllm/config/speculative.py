@@ -275,6 +275,9 @@ class SpeculativeConfig:
                 self.model = "ngram"
             elif self.method == "suffix":
                 self.model = "suffix"
+            elif self.method == "customize":
+                # 自定义规则式 proposer，不需要 draft model，直接允许
+                pass
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
