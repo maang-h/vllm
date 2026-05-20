@@ -70,6 +70,9 @@ class EngineCoreClient(ABC):
     """
     EngineCoreClient: subclasses handle different methods for pushing
         and pulling from the EngineCore for asyncio / multiprocessing.
+        
+    定义与 EngineCore 交互的统一接口：加请求、取输出、工具调用、LoRA、shutdown 等，
+    并区分同步（add_request / get_output）与异步（*_async）
 
     Subclasses:
     * InprocClient: In process EngineCore (for V0-style LLMEngine use)

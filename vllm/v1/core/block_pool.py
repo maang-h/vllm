@@ -165,6 +165,12 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
+        # 自由块队列，用于构建和操作自由块的双向链表（包括启用缓存时的驱逐候选块）。
+        """
+         「eviction candidates」是什么
+            请求结束或 free 某条 block 链时，block 的 ref_cnt 会减到 0，但 若这块曾写满且算过 hash，
+            可能仍留在 cached_block_hash_to_block 里，供 别的请求 prefix 命中。
+        """
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
@@ -190,7 +196,7 @@ class BlockPool:
 
         Args:
             block_hash: The hash value of the block.
-            kv_cache_group_ids: The ids of the KV cache groups.
+            kv_cache_group_ids: The ids of the KV cache groups.  假设就一个：[0]
 
         Returns:
             The cached blocks if exists, or None.
@@ -199,7 +205,7 @@ class BlockPool:
         for group_id in kv_cache_group_ids:
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, group_id
-            )
+            )  # 使用 group_id 扩展 block_hash 为 BlockHashWithGroupId
             block = self.cached_block_hash_to_block.get_one_block(
                 block_hash_with_group_id
             )

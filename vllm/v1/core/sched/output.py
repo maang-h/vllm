@@ -29,10 +29,14 @@ else:
 
 @dataclass
 class NewRequestData:
+    # 请求id
     req_id: str
     prompt_token_ids: list[int] | None
     mm_features: list[MultiModalFeatureSpec]
+    # 生成式模型（Chat / Completion）用的采样参数， 
+    # temperature、top_p、top_k、max_tokens
     sampling_params: SamplingParams | None
+    # Pooling 模型（Embedding / Classify / Rerank 等）用的参数，不做自回归「一个一个生成 token」
     pooling_params: PoolingParams | None
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
@@ -108,6 +112,7 @@ class NewRequestData:
 
 @dataclass
 class CachedRequestData:
+    # 本步要更新的请求 ID 列表
     req_ids: list[str]
     # For request ids not in resumed_req_ids, new_block_ids will be appended to
     # the request's block IDs. For those in the set, new_block_ids will be used as the
@@ -115,12 +120,15 @@ class CachedRequestData:
     resumed_req_ids: set[str]
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
     # When PP is not used, new_token_ids will be empty.
+    # 主要给 PP 用，把上一步采样 token 传回
     new_token_ids: list[list[int]]
     # For requests not scheduled in the last step, propagate the token ids to the
     # connector. Won't contain requests that were scheduled in the prior step.
     all_token_ids: dict[str, list[int]]
     new_block_ids: list[tuple[list[int], ...] | None]
+    # 到本步调度为止，该请求 已经过模型前向、并写入 KV cache 的 token 总数
     num_computed_tokens: list[int]
+    # 该请求 已生成的输出 token 数（并计入 async 占位），用于区分 prefill / decode、同步输出长度
     num_output_tokens: list[int]
 
     # Version of dataclass repr with token IDs obfuscated.
@@ -180,21 +188,27 @@ class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
     # need to re-send it every scheduling step.
+    # 首次调度的请求列表
+    # 在 Scheduler 里主要来自 RequestStatus.WAITING 刚被调度进 running 的请求
     scheduled_new_reqs: list[NewRequestData]
     # list of the requests that have been scheduled before.
     # Since the request's data is already cached in the worker processes,
     # we only send the diff to minimize the communication cost.
+    # 后续(非首次)调度的请求列表
     scheduled_cached_reqs: CachedRequestData
 
     # req_id -> num_scheduled_tokens
     # Number of tokens scheduled for each request.
+    # 每个请求调度的token数量
     num_scheduled_tokens: dict[str, int]
     # Total number of tokens scheduled for all requests.
     # Equal to sum(num_scheduled_tokens.values())
+    # 调度的总token数量
     total_num_scheduled_tokens: int
     # req_id -> spec_token_ids
     # If a request does not have any spec decode tokens, it will not be
     # included in the dictionary.
+    # 需要投机解码的请求的投机解码的token
     scheduled_spec_decode_tokens: dict[str, list[int]]
     # req_id -> encoder input indices that need processing.
     # E.g., if a request has [0, 1], it could mean the vision encoder needs
@@ -202,11 +216,13 @@ class SchedulerOutput:
     scheduled_encoder_inputs: dict[str, list[int]]
     # Number of common prefix blocks for all requests in each KV cache group.
     # This can be used for cascade attention.
+    # 每个request命中prefix缓存的block数量
     num_common_prefix_blocks: list[int]
 
     # Request IDs that are finished in between the previous and the current
     # steps. This is used to notify the workers about the finished requests
     # so that they can free the cached states for those requests.
+    # 已完成的请求的id
     finished_req_ids: set[str]
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
@@ -214,17 +230,22 @@ class SchedulerOutput:
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
+    # 被抢占的请求的id
     preempted_req_ids: set[str] | None = None
 
     # Whether any of the scheduled requests use structured output.
     # Set only in async scheduling case.
+    # 是否有需要结构化输出的请求
     has_structured_output_requests: bool = False
 
     # Whether the scheduled requests have all the output tokens they
     # need to perform grammar bitmask computation.
+    # 调度请求是否具有执行语法位掩码计算所需的所有输出令牌。？？？
     pending_structured_output_tokens: bool = False
 
-    # Used for adjusting acceptance rate calculation.
+    # Used for adjusting acceptance rate calculation. ？？？
+    # 在本轮投机解码里，每个请求有多少个 draft token 
+    # 因不满足 grammar（结构化输出约束）而被判为无效
     num_invalid_spec_tokens: dict[str, int] | None = None
 
     # KV Cache Connector metadata.
@@ -236,6 +257,7 @@ class SchedulerOutput:
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
+    # 本调度步里刚从 KV block 池新分配、尚未使用过的 block ID 列表；
     new_block_ids_to_zero: list[int] | None = None
 
     @classmethod

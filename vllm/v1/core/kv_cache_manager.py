@@ -28,6 +28,12 @@ class KVCacheBlocks:
 
     blocks: tuple[Sequence[KVCacheBlock], ...]
     """
+    blocks[i][j]是指第i个kv_cache_group和第j个令牌块。
+    这里的kv_cache_group指的是按 attention/KV 类型把模型层分成几类；每类单独管 block 表。
+    blocks[i][j] 就是「第 i 类 KV」里「第 j 块 token」对应的物理 block。
+    通常来说，纯decoder模型且全是full attention下，group = 1
+    一些Hybrid模型中，可能使用的是full + sliding window，group会大于1
+
     `blocks[i][j]` refers to the i-th kv_cache_group
     and the j-th block of tokens.We don't use block of
     tokens as the outer dimension because it assumes all
@@ -112,16 +118,21 @@ class KVCacheManager:
         enable_caching: bool = True,
         use_eagle: bool = False,
         log_stats: bool = False,
-        enable_kv_cache_events: bool = False,
+        enable_kv_cache_events: bool = False,  # 是否向外部发布 KV cache 生命周期事件
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ) -> None:
+        """
+         enable_kv_cache_events: bool = False,  # 是否向外部发布 KV cache 生命周期事件
+        dcp_world_size: int = 1,  Decode Context Parallel（解码上下文并行）的 world size
+        pcp_world_size: int = 1,  Prefill Context Parallel（前缀上下文并行）的 world size
+        """
         self.max_model_len = max_model_len
 
-        self.enable_caching = enable_caching
-        self.use_eagle = use_eagle
-        self.log_stats = log_stats
+        self.enable_caching = enable_caching  # 是否启用 prefix caching（前缀 KV 缓存复用）。
+        self.use_eagle = use_eagle  # 是否使用 EAGLE 投机解码
+        self.log_stats = log_stats  # 是否记录 prefix cache 相关统计。
         self.metrics_collector = metrics_collector
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
@@ -139,8 +150,8 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
         )
-        self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
-        self.block_pool = self.coordinator.block_pool
+        self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)  # 多少种kv cache形式
+        self.block_pool = self.coordinator.block_pool  # BlockPool 
         self.kv_cache_config = kv_cache_config
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this

@@ -437,7 +437,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-            [] for _ in range(len(kv_cache_group_ids))
+            [] for _ in range(len(kv_cache_group_ids))  # ([],)
         )
         block_size = kv_cache_spec.block_size
         if dcp_world_size * pcp_world_size > 1:
@@ -457,8 +457,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if use_eagle and computed_blocks[0]:
             # Need to drop the last matched block if eagle is enabled.
             for computed in computed_blocks:
-                computed.pop()
-        while (
+                computed.pop()  # 丢掉命中的最后一块  TODO: (for maang)具体为什么？在学习投机解码的时候需要搞清楚
+        while (  # TODO: (for maang)需要搞清楚这里的逻辑
             block_size != alignment_tokens  # Faster for common case.
             and len(computed_blocks[0]) * block_size % alignment_tokens != 0
         ):

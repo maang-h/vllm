@@ -3367,11 +3367,13 @@ class GPUModelRunner(
         dict[str, int],
         list[int],
     ]:
+        # 每个 req_id 对应 logits 中 NaN 的个数（仅诊断开启时非空）
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
 
         num_reqs = self.input_batch.num_reqs
+        # 本步不应提交采样结果的请求在 batch 中的下标（如 chunked prefill 的 partial 请求）
         discard_sampled_tokens_req_indices = np.nonzero(
             self.discard_request_mask.np[:num_reqs]
         )[0]
@@ -3382,19 +3384,24 @@ class GPUModelRunner(
 
         # Copy some objects so they don't get modified after returning.
         # This is important when using async scheduling.
+        # req_ids 快照，避免异步调度在返回前修改 batch
         req_ids_output_copy = self.input_batch.req_ids.copy()
+        # req_id -> batch 下标 快照
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
+        # 无效采样对应的 batch 下标（异步调度时填充）
         invalid_req_indices = []
+        # 本步生成 token 的 top-k logprobs（CPU 侧，未请求则为 None）
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
+                # 每个请求本步采样的 token id 列表（同步路径，GPU -> CPU）
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
@@ -3411,6 +3418,7 @@ class GPUModelRunner(
                     logprobs_tensors=logprobs_tensors,
                 )
         else:
+            # 占位；真实 token 暂留 GPU，下一步 prepare_inputs 再拷贝
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
@@ -3461,20 +3469,20 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
-        # Compute prompt logprobs if needed.
+        # 各请求在 prefill 阶段的 prompt logprobs（与 decode 采样分开）
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
         )
 
         return (
-            num_nans_in_logits,
-            logprobs_lists,
-            valid_sampled_token_ids,
-            prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
+            num_nans_in_logits,  # dict[req_id, nan_count]
+            logprobs_lists,  # 生成 token 的 logprobs，LogprobsLists | None
+            valid_sampled_token_ids,  # 每请求本步 token id：list[list[int]]
+            prompt_logprobs_dict,  # prefill prompt logprobs：dict[req_id, ...]
+            req_ids_output_copy,  # 本 batch 请求 id 列表快照
+            req_id_to_index_output_copy,  # req_id -> 下标 快照
+            invalid_req_indices,  # 应丢弃采样的 batch 下标
         )
 
     @contextmanager
@@ -3774,7 +3782,7 @@ class GPUModelRunner(
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,  # 流水线并行 PP时在state之间传递的激活张量，用于后续层的计算
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError(
@@ -4061,7 +4069,7 @@ class GPUModelRunner(
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
-                if self.is_pooling_model:
+                if self.is_pooling_model: # pooling模型：例如，embedding、rerank等
                     # Return the pooling output.
                     return self._pool(
                         hidden_states,
@@ -4071,6 +4079,14 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+
+                # logits_indices：
+                # 要参与采样的 token 在 batch 里的下标（torch.Tensor）。
+                # 无 speculative decode 时通常是每个请求的最后一个 token：query_start_loc[1:] - 1
+                sample_hidden_states = hidden_states[logits_indices]
+                # [num_sample_positions, vocab_size]
+                # logits 是词表维上的未归一化分数；
+                # 概率要在采样阶段经 temperature、惩罚、top-k/p 等处理后再通过 softmax 得到。
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -4102,6 +4118,7 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # 临时缓存，接下来sample token时使用
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4279,15 +4296,16 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        # 把 GPU 上的采样结果整理成可返回给 scheduler 的 CPU 数据，并更新 worker 本地 batch 状态ß
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
-                num_nans_in_logits,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
+                num_nans_in_logits,  # 每个请求 logits 中 NaN 个数
+                logprobs_lists,  # 本步生成 token 的 top-k logprobs
+                valid_sampled_token_ids,  # 每请求本步有效采样 token
+                prompt_logprobs_dict,  # prefill 阶段各请求的 prompt logprobs
+                req_ids_output_copy,  # 本 batch 请求 id 快照
+                req_id_to_index_output_copy,  # req_id -> batch 下标 快照
+                invalid_req_indices,  # 本步无效/应丢弃的请求下标
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,

@@ -56,7 +56,7 @@ class KVCacheCoordinator(ABC):
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
-        self.single_type_managers = tuple(
+        self.single_type_managers = tuple[SingleTypeKVCacheManager, ...](
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 block_pool=self.block_pool,
@@ -329,6 +329,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
         )
+        # 只有一个group，所以默认取第一个group
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -339,6 +340,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             self.block_size *= pcp_world_size
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
+        # TODO: (for maang pr) 是不是要删掉
         assert not enable_caching or (hash_block_size == self.block_size), (
             "UnitaryKVCacheCoordinator assumes hash_block_size == block_size"
         )

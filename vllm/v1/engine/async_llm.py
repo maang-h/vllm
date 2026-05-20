@@ -347,6 +347,7 @@ class AsyncLLM(EngineClient):
                     "latter will be used, and the former will be ignored."
                 )
         else:
+            # EngineCoreRequest
             request = self.input_processor.process_inputs(
                 request_id,
                 prompt,

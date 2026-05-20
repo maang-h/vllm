@@ -217,6 +217,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         reasoning_parser: ReasoningParser | None = None
+        # 思考过程解析类
         if self.reasoning_parser_cls:
             # Pass the same chat template kwargs as used in tokenization
             chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
@@ -227,11 +228,13 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
+
+        # 解析出request中的对话
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
-        conversation, engine_inputs = result
+        conversation, engine_inputs = result  # list[EngineInput]
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
@@ -312,6 +315,7 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     reasoning_ended = None
 
+                #
                 generator = self.engine_client.generate(
                     engine_input,
                     sampling_params,

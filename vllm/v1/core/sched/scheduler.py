@@ -357,14 +357,14 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
-        scheduled_new_reqs: list[Request] = []
-        scheduled_resumed_reqs: list[Request] = []
-        scheduled_running_reqs: list[Request] = []
-        preempted_reqs: list[Request] = []
+        scheduled_new_reqs: list[Request] = []  # 记录本次调度中从waiting -> running的请求
+        scheduled_resumed_reqs: list[Request] = []  # 记录本次调度中从preempt_waiting -> running的请求
+        scheduled_running_reqs: list[Request] = []  # 记录本次调度中从running -> running的请求
+        preempted_reqs: list[Request] = []  # 记录本次调度中被抢占的请求
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
-        num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        num_scheduled_tokens: dict[str, int] = {}  # 记录本次调度中每个请求需计算的token数量
+        token_budget = self.max_num_scheduled_tokens  # 本次调度步的 token 预算
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -378,6 +378,7 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # 新一轮调度（scheduling step）开始时，通知 KV cache 子系统「上一步的按步状态结束，这一步重新开始记账」
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
@@ -406,6 +407,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # 是 分块 prefill（chunked prefill） 用的阈值：一次调度步里，
+            # 单个请求最多先算多少个 尚未算过的 prefill token；超过的部分留到后面的 step 再算。
+            # 在running队列中不等于是做完prefill的，因为chunk prefill下可能会导致一个req做多次prefill
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -460,6 +464,7 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    # 给未计算的token分配 KV block
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
@@ -469,7 +474,7 @@ class Scheduler(SchedulerInterface):
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
-
+                    # 显存不足时，抢占一个优先级最低的请求  
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
@@ -477,6 +482,7 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                        # remove  max(priority, arrival_time) 的请求
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
@@ -497,8 +503,10 @@ class Scheduler(SchedulerInterface):
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
                     else:
+                        # fcfs 抢占策略：抢占队列中最早到达的请求
                         preempted_req = self.running.pop()
 
+                    # TODO: (for maang)抢占时需要做些别的什么额外操作？显存如何释放？
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -565,9 +573,12 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
+                # 当达到最大运行请求数时，停止调度
+                # running中不用判断是因为running中的请求都是来自这里
                 if len(self.running) == self.max_num_running_reqs:
                     break
-
+                
+                # 调度waiting队列或者skipped_waiting队列中的请求
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
@@ -575,6 +586,7 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
+                # 判断是否有其他在阻塞当前request并promote它
                 if self._is_blocked_waiting_status(
                     request.status
                 ) and not self._try_promote_blocked_waiting_request(request):
@@ -609,6 +621,14 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
+                    """
+                    # new_computed_blocks
+                    在 vLLM 本地 prefix cache 里，和该请求 prompt 前缀匹配、
+                    且已经存有 KV 的 物理 block 列表
+
+                    # num_new_local_computed_tokens
+                    本地 prefix cache 命中带来的 token 数量
+                    """
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
@@ -697,7 +717,10 @@ class Scheduler(SchedulerInterface):
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
-
+                
+                # 混合模型（Attention + Mamba） 且 mamba_cache_mode == "align" 时生效，
+                # 用来在调度 waiting 新请求 时，把本步的 num_new_tokens 按 block 边界对齐，
+                # 好让 Mamba 的 state cache 和 Full Attention 的 block 对齐
                 if self.need_mamba_block_aligned_split:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
@@ -742,7 +765,8 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
-
+                
+                # 分配显存块
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -864,6 +888,7 @@ class Scheduler(SchedulerInterface):
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
+        # 计算还占用着kv cache的请求（不止本次调度的请求）的公共前缀block数量
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
             if self.running:

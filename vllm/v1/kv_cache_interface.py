@@ -112,7 +112,7 @@ class KVCacheSpec:
 
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
-    num_kv_heads: int
+    num_kv_heads: int  # kv head
     head_size: int
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
@@ -512,9 +512,14 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
 class KVCacheTensor:
     """
     A class for specifying how the workers should initialize the KV cache.
-    """
+    描述的是 Worker 侧要在 GPU 上分配哪一块物理显存
 
+    Worker 启动时应为某块 KV 缓冲区分配多少字节、哪些层共用这一块显存
+    """
+    # 这块 KV cache 张量在 GPU 上的总字节数。
+    # Worker 会按这个大小分配一块连续 buffer（先用 int8 占位，再 reshape 成 K/V 形状）
     size: int  # size of the KV cache tensor in bytes
+    
     shared_by: list[str]  # layer names that share the same KV cache tensor
 
 
@@ -526,8 +531,10 @@ class KVCacheGroupSpec:
     """
 
     # The names of model layers in this group
+    # 属于这个 kv_cache_group 的 模型层名字列表，例如：model.layers.0.self_attn
     layer_names: list[str]
     # The KV cache spec of this manager layer
+    # 这一组 KV cache 的 格式与行为规格，例如：FullAttentionSpec
     kv_cache_spec: KVCacheSpec
 
 
